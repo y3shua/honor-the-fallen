@@ -1,28 +1,22 @@
-name: Post Daily Tribute to Facebook
-
+name: Daily Fallen Heroes Memorial
 on:
   schedule:
-    - cron: '0 13 * * *'
+    - cron: '0 12 * * *'  # Daily at noon UTC
   workflow_dispatch:
 
 jobs:
-  post:
+  post-memorial:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: pip install requests beautifulsoup4
-
-      - name: Run Tribute Script
-        env:
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
-        run: python3 query-fallen.py
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: pip install requests beautifulsoup4
+    - name: Post Memorial
+      env:
+        FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+        FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+      run: python query-fallen.py

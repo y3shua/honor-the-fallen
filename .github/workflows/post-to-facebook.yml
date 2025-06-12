@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '0 12 * * *'  # Daily at noon UTC
   workflow_dispatch:
+    inputs:
+      search_mode:
+        description: 'Search mode (daily/comprehensive/recent)'
+        required: false
+        default: 'daily'
 
 jobs:
   post-memorial:
@@ -14,9 +19,10 @@ jobs:
       with:
         python-version: '3.11'
     - name: Install dependencies
-      run: pip install requests beautifulsoup4
+      run: pip install requests beautifulsoup4 Pillow
     - name: Post Memorial
       env:
         FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
         FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+        SEARCH_MODE: ${{ github.event.inputs.search_mode || 'daily' }}
       run: python query-fallen.py

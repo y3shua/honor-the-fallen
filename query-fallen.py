@@ -2,20 +2,24 @@
 """
 Fallen Heroes Memorial Script
 Queries fallen service members from militarytimes.com and posts detailed memorials to Facebook
+Enhanced with location of death extraction and comprehensive search coverage
 """
 
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import time
 import re
+from PIL import Image
+import io
 
 # Environment variables
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 PAGE_ID = os.getenv("FB_PAGE_ID")
 USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
 PROXY = os.getenv("PROXY_URL")
+SEARCH_MODE = os.getenv("SEARCH_MODE", "daily")  # daily, comprehensive, or date_range
 
 def get_fallen_service_members(date):
     """Query fallen service members for a specific date"""
@@ -67,6 +71,29 @@ def get_fallen_service_members(date):
 
     return fallen_list
 
+def search_comprehensive_range(start_date, end_date):
+    """Search for all fallen service members in a date range"""
+    print(f"[*] Comprehensive search from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
+    
+    all_service_members = []
+    current_date = start_date
+    
+    while current_date <= end_date:
+        print(f"[*] Searching {current_date.strftime('%m/%d/%Y')}...")
+        fallen = get_fallen_service_members(current_date)
+        
+        if fallen:
+            print(f"    Found {len(fallen)} service members")
+            for person in fallen:
+                if person["image_url"]:
+                    all_service_members.append(person)
+                    print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+        
+        current_date += timedelta(days=1)
+        time.sleep(1)  # Rate limiting for comprehensive search
+    
+    return all_service_members
+
 def get_detailed_service_member_info(profile_link):
     """Get detailed information from the service member's profile page"""
     if not profile_link:
@@ -101,7 +128,7 @@ def get_detailed_service_member_info(profile_link):
         if rank_match:
             details["rank"] = rank_match.group(1)
         
-        # Extract hometown/location
+        # Extract hometown/location (where they're from)
         location_patterns = [
             r'of ([^,\n]+(?:, [A-Z]{2})?)',
             r'from ([^,\n]+(?:, [A-Z]{2})?)',
@@ -113,6 +140,24 @@ def get_detailed_service_member_info(profile_link):
                 location = location_match.group(1).strip()
                 if len(location) > 3 and not location.lower().startswith(('the', 'was', 'and', 'who')):
                     details["location"] = location
+                    break
+        
+        # Extract location of death/incident (where they died)
+        death_location_patterns = [
+            r'killed in ([^,\n.]+(?:, [A-Za-z]+)?)',
+            r'died in ([^,\n.]+(?:, [A-Za-z]+)?)',
+            r'in ([A-Za-z\s]+(?:, Iraq|, Afghanistan|, Syria))',
+            r'(Iraq|Afghanistan|Syria|Kuwait|Pakistan|Jordan|Somalia|Yemen)',
+            r'province of ([A-Za-z\s]+)',
+            r'near ([A-Za-z\s]+(?:, Iraq|, Afghanistan))'
+        ]
+        
+        for pattern in death_location_patterns:
+            death_location_match = re.search(pattern, content, re.IGNORECASE)
+            if death_location_match:
+                death_location = death_location_match.group(1).strip()
+                if len(death_location) > 2 and not death_location.lower().startswith(('the', 'was', 'and', 'who', 'a ')):
+                    details["death_location"] = death_location
                     break
         
         # Extract branch of service
@@ -150,6 +195,45 @@ def get_detailed_service_member_info(profile_link):
         print(f"[!] Error getting details for {profile_link}: {e}")
         return {}
 
+def resize_image_for_facebook(image_data):
+    """Resize image to optimal Facebook dimensions to prevent stretching"""
+    try:
+        # Open image with PIL
+        image = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if necessary (handles RGBA, P mode, etc.)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Facebook optimal dimensions for photos
+        # Square: 1200x1200, Landscape: 1200x630, Portrait: 630x1200
+        width, height = image.size
+        
+        # Determine orientation and resize accordingly
+        if width == height:
+            # Square image
+            target_size = (1200, 1200)
+        elif width > height:
+            # Landscape
+            aspect_ratio = height / width
+            target_size = (1200, int(1200 * aspect_ratio))
+        else:
+            # Portrait
+            aspect_ratio = width / height
+            target_size = (int(1200 * aspect_ratio), 1200)
+        
+        # Resize image maintaining aspect ratio
+        resized_image = image.resize(target_size, Image.Resampling.LANCZOS)
+        
+        # Save to bytes
+        output = io.BytesIO()
+        resized_image.save(output, format='JPEG', quality=85, optimize=True)
+        return output.getvalue()
+        
+    except Exception as e:
+        print(f"[!] Error resizing image: {e}")
+        return image_data  # Return original if resize fails
+
 def create_detailed_caption(person, details):
     """Create a detailed caption with all available information"""
     caption_parts = []
@@ -178,8 +262,12 @@ def create_detailed_caption(person, details):
     if details.get("location"):
         caption_parts.append(f"🏠 Hometown: {details['location']}")
     
-    # Date of sacrifice
+    # Date and location of sacrifice
     caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
+    
+    if details.get("death_location"):
+        caption_parts.append(f"📍 Location: {details['death_location']}")
+    
     caption_parts.append("")
     
     # Circumstances if available
@@ -244,7 +332,7 @@ def post_images_to_facebook(service_members):
         
         try:
             # Download the image
-            print(f"    → Downloading photo...")
+            print(f"    → Downloading and processing photo...")
             proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
             image_response = requests.get(person["image_url"], proxies=proxies, timeout=30)
             
@@ -252,18 +340,22 @@ def post_images_to_facebook(service_members):
                 print(f"    ❌ Failed to download image (Status: {image_response.status_code})")
                 continue
             
-            image_data = image_response.content
+            original_image_data = image_response.content
             
             # Validate image data
-            if len(image_data) < 1000:  # Less than 1KB is probably not a valid image
+            if len(original_image_data) < 1000:  # Less than 1KB is probably not a valid image
                 print(f"    ❌ Image file too small, likely invalid")
                 continue
+            
+            # Resize image for Facebook to prevent stretching
+            print(f"    → Resizing image for optimal Facebook display...")
+            processed_image_data = resize_image_for_facebook(original_image_data)
             
             # Upload photo directly as a published post
             print(f"    → Posting to Facebook...")
             upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
             
-            files = {'source': ('hero_photo.jpg', image_data, 'image/jpeg')}
+            files = {'source': ('hero_photo.jpg', processed_image_data, 'image/jpeg')}
             data = {
                 "message": caption,
                 "access_token": ACCESS_TOKEN,
@@ -304,6 +396,7 @@ def main():
     print(f"ACCESS_TOKEN: {'✅ Set (' + str(len(ACCESS_TOKEN)) + ' chars)' if ACCESS_TOKEN else '❌ NOT SET'}")
     print(f"PAGE_ID: {'✅ Set (' + PAGE_ID + ')' if PAGE_ID else '❌ NOT SET'}")
     print(f"USE_PROXY: {USE_PROXY}")
+    print(f"SEARCH_MODE: {SEARCH_MODE}")
     
     if not ACCESS_TOKEN or not PAGE_ID:
         print("\n❌ Missing required environment variables!")
@@ -321,28 +414,50 @@ def main():
         return 1
     
     today = datetime.today()
-    search_years = [2005, 2010, 2015, 2020, 2025]
     all_service_members = []
-
-    print(f"\n[*] 🔍 Searching for fallen service members on {today.strftime('%B %d')}...")
     
-    for year in search_years:
-        search_date = today.replace(year=year)
-        print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')}...")
+    if SEARCH_MODE == "comprehensive":
+        # Search from Iraq invasion start date to present
+        iraq_invasion_date = datetime(2003, 3, 20)
+        print(f"\n[*] 🔍 COMPREHENSIVE SEARCH: Iraq invasion ({iraq_invasion_date.strftime('%m/%d/%Y')}) to present...")
+        all_service_members = search_comprehensive_range(iraq_invasion_date, today)
         
-        fallen = get_fallen_service_members(search_date)
+    elif SEARCH_MODE == "recent":
+        # Search last 30 days
+        start_date = today - timedelta(days=30)
+        print(f"\n[*] 🔍 RECENT SEARCH: Last 30 days ({start_date.strftime('%m/%d/%Y')} to {today.strftime('%m/%d/%Y')})...")
+        all_service_members = search_comprehensive_range(start_date, today)
         
-        if fallen:
-            print(f"    Found {len(fallen)} service members")
-            # Only add those with images
-            for person in fallen:
-                if person["image_url"]:
-                    all_service_members.append(person)
-                    print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+    else:
+        # Default: search today across multiple years
+        search_years = [2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+        print(f"\n[*] 🔍 DAILY SEARCH: Searching for fallen service members on {today.strftime('%B %d')} across multiple years...")
+        
+        for year in search_years:
+            try:
+                search_date = today.replace(year=year)
+                print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')}...")
+                
+                fallen = get_fallen_service_members(search_date)
+                
+                if fallen:
+                    print(f"    Found {len(fallen)} service members")
+                    # Only add those with images
+                    for person in fallen:
+                        if person["image_url"]:
+                            all_service_members.append(person)
+                            print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+                        else:
+                            print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
                 else:
-                    print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
-        else:
-            print(f"    No service members found")
+                    print(f"    No service members found")
+                    
+                time.sleep(1)  # Rate limiting
+                
+            except ValueError:
+                # Handle leap year issues (Feb 29)
+                print(f"    Skipping {year} (date doesn't exist)")
+                continue
 
     print(f"\n" + "=" * 60)
     
@@ -360,7 +475,7 @@ def main():
         
         return 0 if success_count > 0 else 1
     else:
-        print("📭 No fallen service members with images found for this date.")
+        print("📭 No fallen service members with images found for this search.")
         print("🇺🇸 We honor all who have served 🇺🇸")
         print("=" * 60)
         return 0

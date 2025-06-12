@@ -6,8 +6,6 @@ import os
 
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 PAGE_ID = os.getenv("FB_PAGE_ID")
-USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
-PROXY = os.getenv("PROXY_URL")
 
 def get_fallen_service_members(date):
     base_url = "https://thefallen.militarytimes.com/search"

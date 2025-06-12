@@ -1,0 +1,19 @@
+
+# Fallen Heroes Memorial Project Requirements
+# Core dependencies for the fallen heroes memorial script
+
+# HTTP requests and web scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Image processing and optimization
+Pillow>=10.0.0
+
+# HTML parsing (dependency of beautifulsoup4, but specified for clarity)
+lxml>=4.9.0
+
+# Optional: For more robust HTTP handling
+urllib3>=1.26.0
+
+# Optional: For better SSL/TLS support
+certifi>=2023.0.0

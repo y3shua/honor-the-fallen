@@ -2,7 +2,7 @@
 """
 Fallen Heroes Memorial Script
 Queries fallen service members from militarytimes.com and posts detailed memorials to Facebook
-Enhanced with location of death extraction and comprehensive search coverage
+Enhanced with album posting - creates single post with multiple photos
 """
 
 import requests
@@ -243,69 +243,6 @@ def resize_image_for_facebook(image_data):
         print(f"[!] Error resizing image: {e}")
         return image_data  # Return original if resize fails
 
-def create_detailed_caption(person, details):
-    """Create a detailed caption with all available information"""
-    caption_parts = []
-    
-    # Header with flag emoji
-    caption_parts.append("🇺🇸 HONORING OUR FALLEN HERO 🇺🇸")
-    caption_parts.append("")
-    
-    # Name (using ** for emphasis, though Facebook doesn't support markdown)
-    caption_parts.append(f"🎗️ {person['name'].upper()}")
-    caption_parts.append("")
-    
-    # Military information
-    if details.get("rank") and details.get("branch"):
-        caption_parts.append(f"🎖️ {details['branch']} {details['rank']}")
-    elif details.get("rank"):
-        caption_parts.append(f"🎖️ Rank: {details['rank']}")
-    elif details.get("branch"):
-        caption_parts.append(f"⚔️ Branch: {details['branch']}")
-    
-    if details.get("unit"):
-        caption_parts.append(f"🏛️ Unit: {details['unit']}")
-    
-    if details.get("operation"):
-        caption_parts.append(f"🌟 Operation: {details['operation']}")
-    
-    if details.get("age"):
-        caption_parts.append(f"👤 Age: {details['age']}")
-    
-    if details.get("location"):
-        caption_parts.append(f"🏠 Hometown: {details['location']}")
-    
-    # Date and location of sacrifice
-    caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
-    
-    if details.get("death_location"):
-        caption_parts.append(f"📍 Location of Sacrifice: {details['death_location']}")
-    
-    caption_parts.append("")
-    
-    # Circumstances if available
-    if details.get("circumstances"):
-        caption_parts.append("💔 How They Died:")
-        caption_parts.append(details['circumstances'])
-        caption_parts.append("")
-    
-    # Add story excerpt if available
-    if details.get("story"):
-        caption_parts.append("📖 Remembered:")
-        caption_parts.append(details['story'])
-        caption_parts.append("")
-    
-    # Footer
-    caption_parts.append("🕊️ We will never forget their service and sacrifice.")
-    caption_parts.append("🙏 Thank you for your service and ultimate sacrifice.")
-    caption_parts.append("⭐ A true American hero.")
-    caption_parts.append("")
-    caption_parts.append(f"🔗 Learn more: https://thefallen.militarytimes.com{person['link'].rstrip(':').rstrip()}")
-    caption_parts.append("")
-    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero #Freedom")
-    
-    return "\n".join(caption_parts)
-
 def test_facebook_credentials():
     """Test if Facebook credentials are valid"""
     print("[*] Testing Facebook credentials...")
@@ -331,10 +268,11 @@ def test_facebook_credentials():
         print(f"❌ Error testing credentials: {e}")
         return False
 
-def post_images_to_facebook(service_members):
-    """Post individual photos with detailed captions for each service member"""
-    print(f"[*] Uploading {len(service_members)} photos to Facebook...")
-    successful_posts = 0
+def upload_photos_to_album(service_members):
+    """Upload photos to Facebook without publishing, return photo IDs for album creation"""
+    print(f"[*] Uploading {len(service_members)} photos to Facebook album...")
+    photo_ids = []
+    service_member_details = []
     
     for i, person in enumerate(service_members, 1):
         if not person["image_url"]:
@@ -346,9 +284,7 @@ def post_images_to_facebook(service_members):
         # Get detailed information
         print(f"    → Fetching profile details...")
         details = get_detailed_service_member_info(person["link"])
-        
-        # Create detailed caption
-        caption = create_detailed_caption(person, details)
+        service_member_details.append((person, details))
         
         try:
             # Download the image
@@ -371,29 +307,32 @@ def post_images_to_facebook(service_members):
             print(f"    → Resizing image for optimal Facebook display...")
             processed_image_data = resize_image_for_facebook(original_image_data)
             
-            # Upload photo directly as a published post
-            print(f"    → Posting to Facebook...")
+            # Upload photo to Facebook without publishing (for album creation)
+            print(f"    → Uploading to Facebook...")
             upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
             
             files = {'source': ('hero_photo.jpg', processed_image_data, 'image/jpeg')}
             data = {
-                "message": caption,
                 "access_token": ACCESS_TOKEN,
-                "published": "true"  # Publish immediately with caption
+                "published": "false",  # Don't publish yet - we'll create album post
+                "caption": f"{person['name']} - {person['date']}"  # Simple caption for photo
             }
             
             response = requests.post(upload_url, data=data, files=files, timeout=60)
             
             if response.status_code == 200:
                 result = response.json()
-                post_id = result.get("post_id", "unknown")
-                print(f"    ✅ Successfully posted (Post ID: {post_id})")
-                successful_posts += 1
+                photo_id = result.get("id")
+                if photo_id:
+                    photo_ids.append(photo_id)
+                    print(f"    ✅ Successfully uploaded (Photo ID: {photo_id})")
+                else:
+                    print(f"    ❌ No photo ID returned")
                 
                 # Add delay to avoid rate limiting
-                if i < len(service_members):  # Don't delay after the last post
-                    print(f"    → Waiting 3 seconds...")
-                    time.sleep(3)
+                if i < len(service_members):  # Don't delay after the last photo
+                    print(f"    → Waiting 2 seconds...")
+                    time.sleep(2)
                 
             else:
                 print(f"    ❌ Facebook API error: {response.status_code}")
@@ -403,8 +342,122 @@ def post_images_to_facebook(service_members):
             print(f"    ❌ Error processing {person['name']}: {e}")
             continue
     
-    print(f"\n[*] ✅ Successfully posted {successful_posts} out of {len(service_members)} photos")
-    return successful_posts
+    print(f"\n[*] ✅ Successfully uploaded {len(photo_ids)} out of {len(service_members)} photos")
+    return photo_ids, service_member_details
+
+def create_album_post_caption(service_member_details):
+    """Create a comprehensive caption for the album post with all service members"""
+    today = datetime.today()
+    caption_parts = []
+    
+    # Header
+    caption_parts.append("🇺🇸 HONORING OUR FALLEN HEROES 🇺🇸")
+    caption_parts.append(f"📅 Service Members Who Made the Ultimate Sacrifice on {today.strftime('%B %d')}")
+    caption_parts.append("")
+    caption_parts.append("🎗️ TODAY WE REMEMBER:")
+    caption_parts.append("")
+    
+    # List each service member with key details
+    for i, (person, details) in enumerate(service_member_details, 1):
+        member_info = []
+        member_info.append(f"#{i} {person['name'].upper()}")
+        
+        # Add rank and branch if available
+        if details.get("rank") and details.get("branch"):
+            member_info.append(f"   🎖️ {details['branch']} {details['rank']}")
+        elif details.get("rank"):
+            member_info.append(f"   🎖️ {details['rank']}")
+        elif details.get("branch"):
+            member_info.append(f"   ⚔️ {details['branch']}")
+        
+        # Add age and hometown
+        if details.get("age"):
+            member_info.append(f"   👤 Age {details['age']}")
+        if details.get("location"):
+            member_info.append(f"   🏠 {details['location']}")
+        
+        # Add date and location of sacrifice
+        member_info.append(f"   📅 {person['date']}")
+        if details.get("death_location"):
+            member_info.append(f"   📍 {details['death_location']}")
+        
+        caption_parts.extend(member_info)
+        caption_parts.append("")
+    
+    # Footer
+    caption_parts.append("🕊️ We will never forget their service and sacrifice.")
+    caption_parts.append("🙏 Each of these heroes gave their life for our freedom.")
+    caption_parts.append("⭐ True American heroes, all.")
+    caption_parts.append("")
+    caption_parts.append("🔗 Learn more about each hero:")
+    caption_parts.append("https://thefallen.militarytimes.com/")
+    caption_parts.append("")
+    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Heroes #Freedom #RememberThem")
+    
+    return "\n".join(caption_parts)
+
+def create_multi_photo_post(photo_ids, service_member_details):
+    """Create a single Facebook post with multiple photos"""
+    if not photo_ids:
+        print("[!] No photo IDs to create post with")
+        return False
+    
+    print(f"[*] Creating album post with {len(photo_ids)} photos...")
+    
+    # Create comprehensive caption
+    caption = create_album_post_caption(service_member_details)
+    
+    # Prepare attached_media for multi-photo post
+    attached_media = []
+    for photo_id in photo_ids:
+        attached_media.append({"media_fbid": photo_id})
+    
+    # Create the multi-photo post
+    post_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
+    
+    post_data = {
+        "message": caption,
+        "attached_media": attached_media,
+        "access_token": ACCESS_TOKEN
+    }
+    
+    try:
+        response = requests.post(post_url, json=post_data, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            post_id = result.get("id", "unknown")
+            print(f"✅ Successfully created album post (Post ID: {post_id})")
+            return True
+        else:
+            print(f"❌ Failed to create album post: {response.status_code}")
+            print(f"Error details: {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error creating album post: {e}")
+        return False
+
+def post_images_to_facebook(service_members):
+    """Upload photos and create a single album post with all service members"""
+    print(f"[*] Creating memorial album with {len(service_members)} service members...")
+    
+    # Step 1: Upload all photos without publishing
+    photo_ids, service_member_details = upload_photos_to_album(service_members)
+    
+    if not photo_ids:
+        print("❌ No photos were uploaded successfully")
+        return 0
+    
+    # Step 2: Create single post with all photos
+    success = create_multi_photo_post(photo_ids, service_member_details)
+    
+    if success:
+        print(f"\n✅ Successfully created memorial album post with {len(photo_ids)} heroes")
+        return len(photo_ids)
+    else:
+        print(f"\n❌ Failed to create album post, but {len(photo_ids)} photos were uploaded")
+        return 0
 
 def main():
     """Main function"""
@@ -483,16 +536,16 @@ def main():
     
     if all_service_members:
         print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
-        print(f"🚀 Starting Facebook posting process...")
+        print(f"🚀 Starting Facebook album creation process...")
         print("=" * 60)
         
         success_count = post_images_to_facebook(all_service_members)
         
         print("\n" + "=" * 60)
         if success_count > 0:
-            print(f"✅ COMPLETED: Successfully created 1 post with {success_count} photos")
+            print(f"✅ COMPLETED: Successfully created memorial album with {success_count} heroes")
         else:
-            print("❌ FAILED: No photos were uploaded successfully")
+            print("❌ FAILED: No memorial album was created")
         print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
         print("=" * 60)
         

@@ -55,7 +55,7 @@ def post_images_to_facebook(captions_and_urls):
             print(f"[!] Failed to download image: {image_url} - {e}")
             continue
 
-        upload_url = "https://graph.facebook.com/v19.0/photos"
+        upload_url = "https://graph.facebook.com/v23.0/photos"
         files = {'source': ('image.jpg', image_data, 'image/jpeg')}
         data = {
             "caption": caption,

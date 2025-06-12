@@ -1,25 +1,41 @@
-#!/bin/python3
+#!/usr/bin/env python3
+"""
+Fallen Heroes Memorial Script
+Queries fallen service members from militarytimes.com and posts detailed memorials to Facebook
+"""
+
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import os
+import time
+import re
 
+# Environment variables
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 PAGE_ID = os.getenv("FB_PAGE_ID")
+USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
+PROXY = os.getenv("PROXY_URL")
 
 def get_fallen_service_members(date):
+    """Query fallen service members for a specific date"""
     base_url = "https://thefallen.militarytimes.com/search"
     formatted_date = date.strftime("%m%%2F%d%%2F%Y")
     query_url = f"{base_url}?year=&year_month=&first_name=&last_name=&start_date={formatted_date}&end_date={formatted_date}&conflict=&home_state=&home_town="
 
     headers = {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
-    response = requests.get(query_url, headers=headers, proxies=proxies)
+    
+    try:
+        response = requests.get(query_url, headers=headers, proxies=proxies, timeout=30)
+    except requests.RequestException as e:
+        print(f"[!] Network error fetching {query_url}: {e}")
+        return []
 
     if response.status_code != 200 or "Access Denied" in response.text or "Captcha" in response.text:
-        print(f"[!] Failed or blocked when fetching {query_url}")
+        print(f"[!] Failed or blocked when fetching {query_url} (Status: {response.status_code})")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -29,11 +45,18 @@ def get_fallen_service_members(date):
     for entry in entries:
         name_tag = entry.select_one(".data-box-right h3 a")
         name = name_tag.text.strip() if name_tag else "Unknown"
+        
         date_tag = entry.select_one(".data-box-right .blue-bold")
         date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
+        
         profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
+        
         image_tag = entry.select_one(".data-box-left img")
         image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
+        
+        # Make sure image URL is absolute
+        if image_url and image_url.startswith("/"):
+            image_url = f"https://thefallen.militarytimes.com{image_url}"
 
         fallen_list.append({
             "name": name,
@@ -44,61 +67,303 @@ def get_fallen_service_members(date):
 
     return fallen_list
 
-def post_images_to_facebook(captions_and_urls):
-    print("[*] Uploading images to Facebook...")
-    uploaded_media = []
+def get_detailed_service_member_info(profile_link):
+    """Get detailed information from the service member's profile page"""
+    if not profile_link:
+        return {}
     
-    for caption, image_url in captions_and_urls:
-        try:
-            proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
-            image_data = requests.get(image_url, proxies=proxies).content
-        except Exception as e:
-            print(f"[!] Failed to download image: {image_url} - {e}")
-            continue
-
-        # Fixed upload URL - make sure PAGE_ID is not None/empty
-        upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
+    full_url = f"https://thefallen.militarytimes.com{profile_link}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
+    
+    try:
+        response = requests.get(full_url, headers=headers, proxies=proxies, timeout=30)
+        if response.status_code != 200:
+            print(f"[!] Failed to fetch profile: {full_url} (Status: {response.status_code})")
+            return {}
         
-        files = {'source': ('image.jpg', image_data, 'image/jpeg')}
-        data = {
-            "message": caption,  # Use 'message' instead of 'caption'
-            "access_token": ACCESS_TOKEN,
-            "published": "false"
-        }
+        soup = BeautifulSoup(response.text, "html.parser")
+        details = {}
+        
+        # Get all text content and parse it
+        content = soup.get_text()
+        
+        # Extract age using regex
+        age_match = re.search(r'Age:?\s*(\d+)', content, re.IGNORECASE)
+        if age_match:
+            details["age"] = age_match.group(1)
+        
+        # Extract rank - look for common military ranks
+        rank_pattern = r'\b(PVT|PFC|SPC|CPL|SGT|SSG|SFC|MSG|1SG|SGM|CSM|2LT|1LT|CPT|MAJ|LTC|COL|BG|MG|LTG|GEN|ENS|LTJG|LT|LCDR|CDR|CAPT|RDML|RADM|VADM|ADM|Airman|A1C|SrA|SSgt|TSgt|MSgt|SMSgt|CMSgt|2d Lt|1st Lt|Maj|Lt Col|Brig Gen|Maj Gen|Lt Gen|Pvt|Lance Cpl|Cpl|Sgt|Staff Sgt|Gunnery Sgt|Master Sgt|1st Sgt|Master Gunnery Sgt|Sgt Maj|2ndLt|1stLt|Capt|Major|Lt Colonel|Colonel|Brigadier General|Major General|Lieutenant General|General)\b'
+        rank_match = re.search(rank_pattern, content, re.IGNORECASE)
+        if rank_match:
+            details["rank"] = rank_match.group(1)
+        
+        # Extract hometown/location
+        location_patterns = [
+            r'of ([^,\n]+(?:, [A-Z]{2})?)',
+            r'from ([^,\n]+(?:, [A-Z]{2})?)',
+            r'([A-Za-z\s]+, [A-Z]{2})'
+        ]
+        for pattern in location_patterns:
+            location_match = re.search(pattern, content)
+            if location_match:
+                location = location_match.group(1).strip()
+                if len(location) > 3 and not location.lower().startswith(('the', 'was', 'and', 'who')):
+                    details["location"] = location
+                    break
+        
+        # Extract branch of service
+        branch_pattern = r'\b(Army|Navy|Marine Corps|Marines|Air Force|Coast Guard|Space Force)\b'
+        branch_match = re.search(branch_pattern, content, re.IGNORECASE)
+        if branch_match:
+            details["branch"] = branch_match.group(1)
+        
+        # Get unit information - look for common unit patterns
+        unit_patterns = [
+            r'(\d+(?:st|nd|rd|th)?\s+[^,\n]{10,50}(?:Battalion|Regiment|Brigade|Division|Squadron|Wing|Group))',
+            r'([A-Z][\w\s]*(Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^,\n]{0,30})'
+        ]
+        for pattern in unit_patterns:
+            unit_match = re.search(pattern, content, re.IGNORECASE)
+            if unit_match:
+                details["unit"] = unit_match.group(1).strip()
+                break
+        
+        # Extract circumstances/incident details
+        incident_section = soup.select_one('.incident-details, .profile-details, .bio')
+        if incident_section:
+            incident_text = incident_section.get_text().strip()
+            if len(incident_text) > 50:
+                # Truncate to first sentence or 200 characters
+                sentences = incident_text.split('.')
+                if sentences and len(sentences[0]) < 200:
+                    details["circumstances"] = sentences[0] + "."
+                else:
+                    details["circumstances"] = incident_text[:200] + "..."
+        
+        return details
+        
+    except Exception as e:
+        print(f"[!] Error getting details for {profile_link}: {e}")
+        return {}
 
-        response = requests.post(upload_url, data=data, files=files)
-        if response.status_code == 200:
-            media_id = response.json().get("id")
-            uploaded_media.append({"media_fbid": media_id})
-            print(f"✔ Uploaded image for: {caption.splitlines()[0]}")
-        else:
-            print(f"[X] Upload failed: {response.status_code} - {response.text}")
-            print(f"[DEBUG] Upload URL: {upload_url}")  # Debug line
+def create_detailed_caption(person, details):
+    """Create a detailed caption with all available information"""
+    caption_parts = []
+    
+    # Header with flag emoji
+    caption_parts.append("🇺🇸 HONORING OUR FALLEN HERO 🇺🇸")
+    caption_parts.append("")
+    
+    # Name (using ** for emphasis, though Facebook doesn't support markdown)
+    caption_parts.append(f"🎗️ {person['name'].upper()}")
+    caption_parts.append("")
+    
+    # Military information
+    if details.get("rank"):
+        caption_parts.append(f"🎖️ Rank: {details['rank']}")
+    
+    if details.get("branch"):
+        caption_parts.append(f"⚔️ Branch: {details['branch']}")
+    
+    if details.get("unit"):
+        caption_parts.append(f"🏛️ Unit: {details['unit']}")
+    
+    if details.get("age"):
+        caption_parts.append(f"👤 Age: {details['age']}")
+    
+    if details.get("location"):
+        caption_parts.append(f"🏠 Hometown: {details['location']}")
+    
+    # Date of sacrifice
+    caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
+    caption_parts.append("")
+    
+    # Circumstances if available
+    if details.get("circumstances"):
+        caption_parts.append("📖 Details:")
+        caption_parts.append(details['circumstances'])
+        caption_parts.append("")
+    
+    # Footer
+    caption_parts.append("🕊️ We will never forget their service and sacrifice.")
+    caption_parts.append("🙏 Thank you for your service and ultimate sacrifice.")
+    caption_parts.append("")
+    caption_parts.append(f"🔗 Learn more: https://thefallen.militarytimes.com{person['link']}")
+    caption_parts.append("")
+    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero")
+    
+    return "\n".join(caption_parts)
 
-def main():
-    today = datetime.today()
-    print(f"ACCESS_TOKEN: {'Set' if ACCESS_TOKEN else 'NOT SET'}")
-    print(f"PAGE_ID: {PAGE_ID if PAGE_ID else 'NOT SET'}")
+def test_facebook_credentials():
+    """Test if Facebook credentials are valid"""
+    print("[*] Testing Facebook credentials...")
     
     if not ACCESS_TOKEN or not PAGE_ID:
-        print("[!] Missing required environment variables!")
-        return
-    search_years = [2005, 2010, 2015, 2020, 2025]
-    all_captions_and_images = []
+        print("❌ Missing ACCESS_TOKEN or PAGE_ID")
+        return False
+    
+    # Test basic API access
+    test_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}?access_token={ACCESS_TOKEN}"
+    
+    try:
+        response = requests.get(test_url, timeout=30)
+        
+        if response.status_code == 200:
+            page_info = response.json()
+            print(f"✅ Successfully connected to page: {page_info.get('name', 'Unknown')}")
+            return True
+        else:
+            print(f"❌ Failed to connect: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ Error testing credentials: {e}")
+        return False
 
+def post_images_to_facebook(service_members):
+    """Post individual photos with detailed captions for each service member"""
+    print(f"[*] Uploading {len(service_members)} photos to Facebook...")
+    successful_posts = 0
+    
+    for i, person in enumerate(service_members, 1):
+        if not person["image_url"]:
+            print(f"[!] No image for {person['name']}, skipping...")
+            continue
+        
+        print(f"[*] Processing {i}/{len(service_members)}: {person['name']}...")
+        
+        # Get detailed information
+        print(f"    → Fetching profile details...")
+        details = get_detailed_service_member_info(person["link"])
+        
+        # Create detailed caption
+        caption = create_detailed_caption(person, details)
+        
+        try:
+            # Download the image
+            print(f"    → Downloading photo...")
+            proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
+            image_response = requests.get(person["image_url"], proxies=proxies, timeout=30)
+            
+            if image_response.status_code != 200:
+                print(f"    ❌ Failed to download image (Status: {image_response.status_code})")
+                continue
+            
+            image_data = image_response.content
+            
+            # Validate image data
+            if len(image_data) < 1000:  # Less than 1KB is probably not a valid image
+                print(f"    ❌ Image file too small, likely invalid")
+                continue
+            
+            # Upload photo directly as a published post
+            print(f"    → Posting to Facebook...")
+            upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
+            
+            files = {'source': ('hero_photo.jpg', image_data, 'image/jpeg')}
+            data = {
+                "message": caption,
+                "access_token": ACCESS_TOKEN,
+                "published": "true"  # Publish immediately with caption
+            }
+            
+            response = requests.post(upload_url, data=data, files=files, timeout=60)
+            
+            if response.status_code == 200:
+                result = response.json()
+                post_id = result.get("post_id", "unknown")
+                print(f"    ✅ Successfully posted (Post ID: {post_id})")
+                successful_posts += 1
+                
+                # Add delay to avoid rate limiting
+                if i < len(service_members):  # Don't delay after the last post
+                    print(f"    → Waiting 3 seconds...")
+                    time.sleep(3)
+                
+            else:
+                print(f"    ❌ Facebook API error: {response.status_code}")
+                print(f"    Error details: {response.text}")
+                
+        except Exception as e:
+            print(f"    ❌ Error processing {person['name']}: {e}")
+            continue
+    
+    print(f"\n[*] ✅ Successfully posted {successful_posts} out of {len(service_members)} photos")
+    return successful_posts
+
+def main():
+    """Main function"""
+    print("=" * 60)
+    print("🇺🇸 FALLEN HEROES MEMORIAL FACEBOOK POSTING SCRIPT 🇺🇸")
+    print("=" * 60)
+    
+    # Debug environment variables (don't print actual values for security)
+    print(f"ACCESS_TOKEN: {'✅ Set (' + str(len(ACCESS_TOKEN)) + ' chars)' if ACCESS_TOKEN else '❌ NOT SET'}")
+    print(f"PAGE_ID: {'✅ Set (' + PAGE_ID + ')' if PAGE_ID else '❌ NOT SET'}")
+    print(f"USE_PROXY: {USE_PROXY}")
+    
+    if not ACCESS_TOKEN or not PAGE_ID:
+        print("\n❌ Missing required environment variables!")
+        print("Please set FB_ACCESS_TOKEN and FB_PAGE_ID")
+        return 1
+    
+    # Validate PAGE_ID is numeric
+    if not PAGE_ID.isdigit():
+        print(f"\n❌ PAGE_ID should be numeric, got: {PAGE_ID}")
+        return 1
+    
+    # Test credentials
+    if not test_facebook_credentials():
+        print("\n❌ Facebook credential test failed!")
+        return 1
+    
+    today = datetime.today()
+    search_years = [2005, 2010, 2015, 2020, 2025]
+    all_service_members = []
+
+    print(f"\n[*] 🔍 Searching for fallen service members on {today.strftime('%B %d')}...")
+    
     for year in search_years:
         search_date = today.replace(year=year)
+        print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')}...")
+        
         fallen = get_fallen_service_members(search_date)
-        for person in fallen:
-            if not person["image_url"]:
-                continue
-            caption = f"{person['name']}\n📅 {person['date']}\n🔗 https://thefallen.militarytimes.com{person['link']}"
-            all_captions_and_images.append((caption, person["image_url"]))
+        
+        if fallen:
+            print(f"    Found {len(fallen)} service members")
+            # Only add those with images
+            for person in fallen:
+                if person["image_url"]:
+                    all_service_members.append(person)
+                    print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+                else:
+                    print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
+        else:
+            print(f"    No service members found")
 
-    if all_captions_and_images:
-        post_images_to_facebook(all_captions_and_images)
+    print(f"\n" + "=" * 60)
+    
+    if all_service_members:
+        print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
+        print(f"🚀 Starting Facebook posting process...")
+        print("=" * 60)
+        
+        success_count = post_images_to_facebook(all_service_members)
+        
+        print("\n" + "=" * 60)
+        print(f"✅ COMPLETED: {success_count}/{len(all_service_members)} posts successful")
+        print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
+        print("=" * 60)
+        
+        return 0 if success_count > 0 else 1
     else:
-        print("[*] No fallen service members with images found for this date.")
+        print("📭 No fallen service members with images found for this date.")
+        print("🇺🇸 We honor all who have served 🇺🇸")
+        print("=" * 60)
+        return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())

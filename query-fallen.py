@@ -215,32 +215,28 @@ def resize_image_for_facebook(image_data):
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Facebook optimal dimensions - use square format to prevent stretching
-        # Square images work best in multi-photo posts
-        target_size = (1080, 1080)  # Instagram/Facebook optimal square size
+        # Force exact square dimensions for Facebook multi-photo posts
+        target_size = (1200, 1200)  # Facebook's preferred square size
         
         # Get current dimensions
         width, height = image.size
         
-        # Calculate the scaling to fit the image into the square while maintaining aspect ratio
-        scale = min(target_size[0] / width, target_size[1] / height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
+        # Create a square image by cropping to center square
+        if width != height:
+            # Crop to center square first
+            size = min(width, height)
+            left = (width - size) // 2
+            top = (height - size) // 2
+            right = left + size
+            bottom = top + size
+            image = image.crop((left, top, right, bottom))
         
-        # Resize the image
-        resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        # Create a square canvas with a neutral background
-        square_image = Image.new('RGB', target_size, color='#f0f0f0')  # Light gray background
-        
-        # Center the resized image on the square canvas
-        x_offset = (target_size[0] - new_width) // 2
-        y_offset = (target_size[1] - new_height) // 2
-        square_image.paste(resized_image, (x_offset, y_offset))
+        # Now resize the square image to target size
+        resized_image = image.resize(target_size, Image.Resampling.LANCZOS)
         
         # Save to bytes with high quality
         output = io.BytesIO()
-        square_image.save(output, format='JPEG', quality=95, optimize=True)
+        resized_image.save(output, format='JPEG', quality=98, optimize=True)
         return output.getvalue()
         
     except Exception as e:

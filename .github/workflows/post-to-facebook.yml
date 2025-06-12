@@ -25,6 +25,4 @@ jobs:
         env:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
-          USE_PROXY: ${{ secrets.USE_PROXY }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python3 query-fallen.py

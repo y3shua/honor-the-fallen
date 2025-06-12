@@ -54,6 +54,9 @@ def get_fallen_service_members(date):
         date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
         
         profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
+        # Clean up profile link - remove any trailing colons or extra characters
+        if profile_link:
+            profile_link = profile_link.rstrip(':').rstrip()
         
         image_tag = entry.select_one(".data-box-left img")
         image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
@@ -99,7 +102,14 @@ def get_detailed_service_member_info(profile_link):
     if not profile_link:
         return {}
     
+    # Clean the profile link - remove any trailing colons or whitespace
+    profile_link = profile_link.rstrip(':').rstrip().lstrip('/')
+    if not profile_link.startswith('/'):
+        profile_link = '/' + profile_link
+    
     full_url = f"https://thefallen.militarytimes.com{profile_link}"
+    print(f"    → Fetching: {full_url}")  # Debug URL
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
@@ -247,14 +257,18 @@ def create_detailed_caption(person, details):
     caption_parts.append("")
     
     # Military information
-    if details.get("rank"):
+    if details.get("rank") and details.get("branch"):
+        caption_parts.append(f"🎖️ {details['branch']} {details['rank']}")
+    elif details.get("rank"):
         caption_parts.append(f"🎖️ Rank: {details['rank']}")
-    
-    if details.get("branch"):
+    elif details.get("branch"):
         caption_parts.append(f"⚔️ Branch: {details['branch']}")
     
     if details.get("unit"):
         caption_parts.append(f"🏛️ Unit: {details['unit']}")
+    
+    if details.get("operation"):
+        caption_parts.append(f"🌟 Operation: {details['operation']}")
     
     if details.get("age"):
         caption_parts.append(f"👤 Age: {details['age']}")
@@ -266,23 +280,30 @@ def create_detailed_caption(person, details):
     caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
     
     if details.get("death_location"):
-        caption_parts.append(f"📍 Location: {details['death_location']}")
+        caption_parts.append(f"📍 Location of Sacrifice: {details['death_location']}")
     
     caption_parts.append("")
     
     # Circumstances if available
     if details.get("circumstances"):
-        caption_parts.append("📖 Details:")
+        caption_parts.append("💔 How They Died:")
         caption_parts.append(details['circumstances'])
+        caption_parts.append("")
+    
+    # Add story excerpt if available
+    if details.get("story"):
+        caption_parts.append("📖 Remembered:")
+        caption_parts.append(details['story'])
         caption_parts.append("")
     
     # Footer
     caption_parts.append("🕊️ We will never forget their service and sacrifice.")
     caption_parts.append("🙏 Thank you for your service and ultimate sacrifice.")
+    caption_parts.append("⭐ A true American hero.")
     caption_parts.append("")
-    caption_parts.append(f"🔗 Learn more: https://thefallen.militarytimes.com{person['link']}")
+    caption_parts.append(f"🔗 Learn more: https://thefallen.militarytimes.com{person['link'].rstrip(':').rstrip()}")
     caption_parts.append("")
-    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero")
+    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero #Freedom")
     
     return "\n".join(caption_parts)
 

@@ -91,6 +91,12 @@ def post_images_to_facebook(captions_and_urls):
 
 def main():
     today = datetime.today()
+    print(f"ACCESS_TOKEN: {'Set' if ACCESS_TOKEN else 'NOT SET'}")
+    print(f"PAGE_ID: {PAGE_ID if PAGE_ID else 'NOT SET'}")
+    
+    if not ACCESS_TOKEN or not PAGE_ID:
+        print("[!] Missing required environment variables!")
+        return
     search_years = [2005, 2010, 2015, 2020, 2025]
     all_captions_and_images = []
 

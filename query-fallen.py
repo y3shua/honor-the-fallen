@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import os
 import time
 import re
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 
 # Environment variables
@@ -215,29 +215,32 @@ def resize_image_for_facebook(image_data):
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Facebook optimal dimensions for photos
-        # Square: 1200x1200, Landscape: 1200x630, Portrait: 630x1200
+        # Facebook optimal dimensions - use square format to prevent stretching
+        # Square images work best in multi-photo posts
+        target_size = (1080, 1080)  # Instagram/Facebook optimal square size
+        
+        # Get current dimensions
         width, height = image.size
         
-        # Determine orientation and resize accordingly
-        if width == height:
-            # Square image
-            target_size = (1200, 1200)
-        elif width > height:
-            # Landscape
-            aspect_ratio = height / width
-            target_size = (1200, int(1200 * aspect_ratio))
-        else:
-            # Portrait
-            aspect_ratio = width / height
-            target_size = (int(1200 * aspect_ratio), 1200)
+        # Calculate the scaling to fit the image into the square while maintaining aspect ratio
+        scale = min(target_size[0] / width, target_size[1] / height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
         
-        # Resize image maintaining aspect ratio
-        resized_image = image.resize(target_size, Image.Resampling.LANCZOS)
+        # Resize the image
+        resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
         
-        # Save to bytes
+        # Create a square canvas with a neutral background
+        square_image = Image.new('RGB', target_size, color='#f0f0f0')  # Light gray background
+        
+        # Center the resized image on the square canvas
+        x_offset = (target_size[0] - new_width) // 2
+        y_offset = (target_size[1] - new_height) // 2
+        square_image.paste(resized_image, (x_offset, y_offset))
+        
+        # Save to bytes with high quality
         output = io.BytesIO()
-        resized_image.save(output, format='JPEG', quality=85, optimize=True)
+        square_image.save(output, format='JPEG', quality=95, optimize=True)
         return output.getvalue()
         
     except Exception as e:
@@ -490,7 +493,10 @@ def main():
         success_count = post_images_to_facebook(all_service_members)
         
         print("\n" + "=" * 60)
-        print(f"✅ COMPLETED: {success_count}/{len(all_service_members)} posts successful")
+        if success_count > 0:
+            print(f"✅ COMPLETED: Successfully created 1 post with {success_count} photos")
+        else:
+            print("❌ FAILED: No photos were uploaded successfully")
         print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
         print("=" * 60)
         

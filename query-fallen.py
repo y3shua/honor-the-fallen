@@ -269,9 +269,8 @@ def create_individual_hero_caption(person, details, hero_number, total_heroes):
     today = datetime.today()
     caption_parts = []
     
-    # Header with hero number
-    caption_parts.append("🇺🇸 HONORING OUR FALLEN HERO 🇺🇸")
-    caption_parts.append(f"📅 {today.strftime('%B %d')} Memorial - Hero {hero_number} of {total_heroes}")
+    # Header
+    caption_parts.append(f"📅 {today.strftime('%B %d')} Memorial")
     caption_parts.append("")
     
     # Hero's name prominently displayed
@@ -315,7 +314,7 @@ def create_individual_hero_caption(person, details, hero_number, total_heroes):
     caption_parts.append("🙏 Thank you for your ultimate sacrifice for our freedom.")
     caption_parts.append("⭐ A true American hero.")
     caption_parts.append("")
-    caption_parts.append(f"🔗 Learn more: https://thefallen.militarytimes.com{person['link'].rstrip(':').rstrip()}")
+    caption_parts.append(f"🔗 Learn more: {person['link'].rstrip(':').rstrip()}")
     caption_parts.append("")
     caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero #Freedom")
     

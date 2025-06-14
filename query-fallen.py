@@ -137,8 +137,120 @@ def get_detailed_service_member_info(profile_link):
         soup = BeautifulSoup(response.text, "html.parser")
         details = {}
         
-        # Get all text content and parse it
-        content = soup.get_text()
+        # Extract structured information from record-txt div
+        record_txt = soup.select_one(".record-txt")
+        if record_txt:
+            # Get rank, branch, and name from h1
+            h1_tag = record_txt.select_one("h1.h1-size")
+            if h1_tag:
+                full_name_rank = h1_tag.get_text().strip()
+                details["full_name_with_rank"] = full_name_rank
+                print(f"    → Found name with rank: {full_name_rank}")
+            
+            # Get operation and date from h2
+            h2_tag = record_txt.select_one("h2")
+            if h2_tag:
+                h2_text = h2_tag.get_text().strip()
+                details["death_info"] = h2_text
+                print(f"    → Found death info: {h2_text}")
+                
+                # Extract date from h2 text
+                import re
+                date_match = re.search(r'Died ([^S]+) Serving', h2_text)
+                if date_match:
+                    details["formatted_date"] = date_match.group(1).strip()
+                
+                # Extract operation
+                if "Operation" in h2_text:
+                    operation_match = re.search(r'Operation ([^"]+)', h2_text)
+                    if operation_match:
+                        details["operation"] = f"Operation {operation_match.group(1).strip()}"
+            
+            # Get branch from hidden input
+            branch_input = record_txt.select_one('input[name="dimension2"]')
+            if branch_input:
+                details["branch"] = branch_input.get("value", "").strip()
+                print(f"    → Found branch: {details['branch']}")
+        
+        # Get age, hometown, unit, and circumstances from content between <hr> tags
+        if record_txt:
+            # Find the content between <hr> tags or after the first <hr>
+            hr_tags = record_txt.find_all("hr")
+            if hr_tags:
+                # Get text content after first <hr> and before second <hr> (if exists)
+                content_after_hr = ""
+                if len(hr_tags) >= 1:
+                    # Get all text between the <hr> tags or after the first one
+                    current = hr_tags[0].next_sibling
+                    while current and (len(hr_tags) < 2 or current != hr_tags[1]):
+                        if hasattr(current, 'get_text'):
+                            content_after_hr += current.get_text()
+                        elif isinstance(current, str):
+                            content_after_hr += current
+                        current = current.next_sibling
+                
+                if content_after_hr:
+                    content_text = content_after_hr.strip()
+                    print(f"    → Found detailed content: {content_text}")
+                    
+                    # Parse the structured content
+                    # Format: "29, of Morgantown, Ky.; assigned to the 617th Military Police Company..."
+                    
+                    # Extract age and hometown (before first semicolon)
+                    parts = content_text.split(';')
+                    if parts:
+                        age_hometown_part = parts[0].strip()
+                        
+                        # Extract age (number at start)
+                        age_match = re.match(r'^(\d+)', age_hometown_part)
+                        if age_match:
+                            details["age"] = age_match.group(1)
+                            print(f"    → Found age: {details['age']}")
+                        
+                        # Extract hometown (after "of")
+                        hometown_match = re.search(r'of\s+([^;]+)', age_hometown_part)
+                        if hometown_match:
+                            hometown = hometown_match.group(1).strip().rstrip('.')
+                            details["hometown"] = hometown
+                            print(f"    → Found hometown: {hometown}")
+                    
+                    # Extract unit assignment (after "assigned to")
+                    unit_match = re.search(r'assigned to (?:the\s+)?([^;,]+(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;]*)', content_text, re.IGNORECASE)
+                    if unit_match:
+                        unit = unit_match.group(1).strip()
+                        details["unit"] = unit
+                        print(f"    → Found unit: {unit}")
+                    
+                    # Extract circumstances of death (usually after the last semicolon)
+                    if len(parts) > 1:
+                        circumstances_part = parts[-1].strip()
+                        if len(circumstances_part) > 20:  # Only if substantial content
+                            # Clean up the circumstances
+                            circumstances = circumstances_part.rstrip('.')
+                            if not circumstances.endswith('.'):
+                                circumstances += '.'
+                            details["circumstances"] = circumstances
+                            print(f"    → Found circumstances: {circumstances}")
+            
+            # Fallback: try to find the first <p> after record-txt if no <hr> content
+            if not details.get("age"):
+                next_p = record_txt.find_next_sibling("p")
+                if next_p:
+                    p_text = next_p.get_text().strip()
+                    print(f"    → Fallback paragraph: {p_text}")
+                    
+                    # Extract age (number at start of paragraph)
+                    age_match = re.match(r'^(\d+)', p_text)
+                    if age_match:
+                        details["age"] = age_match.group(1)
+                        print(f"    → Found age (fallback): {details['age']}")
+                    
+                    # Extract hometown (everything after "of ")
+                    hometown_match = re.search(r'of (.+)', p_text)
+                    if hometown_match:
+                        hometown = hometown_match.group(1).strip().rstrip('.')
+                        details["hometown"] = hometown
+                        print(f"    → Found hometown (fallback): {hometown}")
         
         # Also check if there's a better quality S3 image URL in the profile
         profile_image_div = soup.select_one(".record-image")
@@ -150,19 +262,8 @@ def get_detailed_service_member_info(profile_link):
                     details["high_quality_image_url"] = s3_image_url
                     print(f"    → Found S3 image: {s3_image_url}")
         
-        # Extract age using regex
-        age_match = re.search(r'Age:?\s*(\d+)', content, re.IGNORECASE)
-        if age_match:
-            details["age"] = age_match.group(1)
-        
-        # Extract rank - look for common military ranks
-        rank_pattern = r'\b(PVT|PFC|SPC|CPL|SGT|SSG|SFC|MSG|1SG|SGM|CSM|2LT|1LT|CPT|MAJ|LTC|COL|BG|MG|LTG|GEN|ENS|LTJG|LT|LCDR|CDR|CAPT|RDML|RADM|VADM|ADM|Airman|A1C|SrA|SSgt|TSgt|MSgt|SMSgt|CMSgt|2d Lt|1st Lt|Maj|Lt Col|Brig Gen|Maj Gen|Lt Gen|Pvt|Lance Cpl|Cpl|Sgt|Staff Sgt|Gunnery Sgt|Master Sgt|1st Sgt|Master Gunnery Sgt|Sgt Maj|2ndLt|1stLt|Capt|Major|Lt Colonel|Colonel|Brigadier General|Major General|Lieutenant General|General)\b'
-        rank_match = re.search(rank_pattern, content, re.IGNORECASE)
-        if rank_match:
-            details["rank"] = rank_match.group(1)
-        
-        # Extract hometown/location (where they're from) - REMOVED DUE TO PARSING ISSUES
-        # Removed location extraction as it was causing incorrect state parsing
+        # Get all text content for additional parsing if needed
+        content = soup.get_text()
         
         # Extract location of death/incident (where they died)
         death_location_patterns = [
@@ -181,12 +282,6 @@ def get_detailed_service_member_info(profile_link):
                 if len(death_location) > 2 and not death_location.lower().startswith(('the', 'was', 'and', 'who', 'a ')):
                     details["death_location"] = death_location
                     break
-        
-        # Extract branch of service
-        branch_pattern = r'\b(Army|Navy|Marine Corps|Marines|Air Force|Coast Guard|Space Force)\b'
-        branch_match = re.search(branch_pattern, content, re.IGNORECASE)
-        if branch_match:
-            details["branch"] = branch_match.group(1)
         
         # Get unit information - look for common unit patterns
         unit_patterns = [
@@ -273,31 +368,42 @@ def create_individual_hero_caption(person, details, hero_number, total_heroes):
     caption_parts.append(f"📅 {today.strftime('%B %d')} Memorial")
     caption_parts.append("")
     
-    # Hero's name prominently displayed
-    caption_parts.append(f"🎗️ {person['name'].upper()}")
+    # Hero's name prominently displayed (use full name with rank if available)
+    if details.get("full_name_with_rank"):
+        caption_parts.append(f"🎗️ {details['full_name_with_rank'].upper()}")
+    else:
+        caption_parts.append(f"🎗️ {person['name'].upper()}")
     caption_parts.append("")
     
     # Military information in clean format
     military_info = []
-    if details.get("rank") and details.get("branch"):
-        military_info.append(f"🎖️ {details['branch']} {details['rank']}")
-    elif details.get("rank"):
-        military_info.append(f"🎖️ {details['rank']}")
-    elif details.get("branch"):
+    
+    # Use branch from structured data
+    if details.get("branch"):
         military_info.append(f"⚔️ {details['branch']}")
     
     if details.get("unit"):
         military_info.append(f"🏛️ {details['unit']}")
     
+    if details.get("operation"):
+        military_info.append(f"🌟 {details['operation']}")
+    
     if details.get("age"):
         military_info.append(f"👤 Age {details['age']}")
+    
+    if details.get("hometown"):
+        military_info.append(f"🏠 {details['hometown']}")
     
     # Add military info
     caption_parts.extend(military_info)
     caption_parts.append("")
     
-    # Sacrifice information
-    caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
+    # Sacrifice information - use structured date if available
+    if details.get("formatted_date"):
+        caption_parts.append(f"📅 Date of Sacrifice: {details['formatted_date']}")
+    else:
+        caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
+    
     if details.get("death_location"):
         caption_parts.append(f"📍 Location: {details['death_location']}")
     

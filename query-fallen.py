@@ -322,8 +322,8 @@ def create_individual_hero_caption(person, details, hero_number, total_heroes):
     return "\n".join(caption_parts)
 
 def post_individual_heroes(service_members):
-    """Post individual photos with captions for each service member as separate feed posts"""
-    print(f"[*] Creating individual feed posts for {len(service_members)} heroes...")
+    """Post individual photos with captions for each service member as separate posts"""
+    print(f"[*] Creating individual posts for {len(service_members)} heroes...")
     successful_posts = 0
     total_heroes = len(service_members)
     
@@ -366,59 +366,60 @@ def post_individual_heroes(service_members):
             print(f"    → Processing image at original size...")
             processed_image_data = process_image_original_size(original_image_data)
             
-            # STEP 1: Upload photo without publishing to get photo ID
-            print(f"    → Uploading photo to Facebook...")
+            # Create unique filename to prevent any potential overwrites
+            import hashlib
+            timestamp = str(int(time.time()))
+            name_hash = hashlib.md5(person['name'].encode()).hexdigest()[:8]
+            unique_filename = f"hero_{name_hash}_{timestamp}.jpg"
+            
+            # Post photo directly with caption (simpler, more reliable method)
+            print(f"    → Posting directly to Facebook...")
             upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
             
-            files = {'source': ('hero_photo.jpg', processed_image_data, 'image/jpeg')}
-            upload_data = {
-                "access_token": ACCESS_TOKEN,
-                "published": "false",  # Don't publish yet
-                "caption": f"Memorial photo for {person['name']}"
-            }
-            
-            upload_response = requests.post(upload_url, data=upload_data, files=files, timeout=60)
-            
-            if upload_response.status_code != 200:
-                print(f"    ❌ Failed to upload photo: {upload_response.status_code}")
-                print(f"    Error: {upload_response.text}")
-                continue
-            
-            upload_result = upload_response.json()
-            photo_id = upload_result.get("id")
-            
-            if not photo_id:
-                print(f"    ❌ No photo ID returned from upload")
-                continue
-            
-            print(f"    ✅ Photo uploaded successfully (ID: {photo_id})")
-            
-            # STEP 2: Create individual feed post with the uploaded photo
-            print(f"    → Creating individual feed post...")
-            feed_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
-            
-            feed_data = {
+            files = {'source': (unique_filename, processed_image_data, 'image/jpeg')}
+            data = {
                 "message": caption,
-                "object_attachment": photo_id,  # Attach the uploaded photo
-                "access_token": ACCESS_TOKEN
+                "access_token": ACCESS_TOKEN,
+                "published": "true",  # Publish immediately
+                "no_story": "false"  # Ensure it appears in feed
             }
             
-            feed_response = requests.post(feed_url, data=feed_data, timeout=60)
+            response = requests.post(upload_url, data=data, files=files, timeout=60)
             
-            if feed_response.status_code == 200:
-                feed_result = feed_response.json()
-                post_id = feed_result.get("id", "unknown")
-                print(f"    ✅ Successfully created individual post (Post ID: {post_id})")
+            if response.status_code == 200:
+                result = response.json()
+                post_id = result.get("post_id", result.get("id", "unknown"))
+                print(f"    ✅ Successfully posted (Post ID: {post_id})")
                 successful_posts += 1
                 
-                # Add delay to ensure posts don't interfere with each other
+                # Add delay to ensure posts are completely separate
                 if i < total_heroes:  # Don't delay after the last post
-                    print(f"    → Waiting 8 seconds before next hero...")
-                    time.sleep(8)  # Longer delay to ensure separation
+                    print(f"    → Waiting 10 seconds before next hero...")
+                    time.sleep(10)  # Longer delay to ensure complete separation
                 
             else:
-                print(f"    ❌ Failed to create feed post: {feed_response.status_code}")
-                print(f"    Error details: {feed_response.text}")
+                print(f"    ❌ Facebook API error: {response.status_code}")
+                print(f"    Error details: {response.text}")
+                
+                # If direct photo post fails, let's try the feed API as backup
+                print(f"    → Trying alternative posting method...")
+                
+                # Try posting as a feed post with link instead
+                feed_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
+                feed_data = {
+                    "message": caption,
+                    "access_token": ACCESS_TOKEN
+                }
+                
+                feed_response = requests.post(feed_url, data=feed_data, timeout=60)
+                
+                if feed_response.status_code == 200:
+                    feed_result = feed_response.json()
+                    post_id = feed_result.get("id", "unknown")
+                    print(f"    ✅ Posted as text post (Post ID: {post_id})")
+                    successful_posts += 1
+                else:
+                    print(f"    ❌ Both posting methods failed")
                 
         except Exception as e:
             print(f"    ❌ Error processing {person['name']}: {e}")

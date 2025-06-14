@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
 """
 Fallen Heroes Memorial Script
-Queries fallen service members from militarytimes.com and posts detailed memorials to Facebook.
-Enhanced with album posting - creates single post with multiple photos.
-Refactored for efficiency and maintainability.
+Queries fallen service members from militarytimes.com and posts detailed memorials to Facebook
+Enhanced with album posting - creates single post with multiple photos
 """
-
-import os
-import re
-import io
-import time
-import logging
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
-
-# Setup logging
-logging.basicConfig(
-    format='[%(asctime)s] %(levelname)s: %(message)s', level=logging.INFO
-)
-log = logging.getLogger(__name__)
+from datetime import datetime, timedelta
+import os
+import time
+import re
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 # Environment variables
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
@@ -31,117 +21,150 @@ USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
 PROXY = os.getenv("PROXY_URL")
 SEARCH_MODE = os.getenv("SEARCH_MODE", "daily")  # daily, comprehensive, or date_range
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    )
-}
-
-def get_requests_session():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    if USE_PROXY and PROXY:
-        session.proxies.update({"http": PROXY, "https": PROXY})
-    return session
-
-def get_fallen_service_members(session, date):
-    """Query fallen service members for a specific date."""
+def get_fallen_service_members(date):
+    """Query fallen service members for a specific date"""
     base_url = "https://thefallen.militarytimes.com/search"
     formatted_date = date.strftime("%m%%2F%d%%2F%Y")
-    query_url = (
-        f"{base_url}?year=&year_month=&first_name=&last_name="
-        f"&start_date={formatted_date}&end_date={formatted_date}"
-        f"&conflict=&home_state=&home_town="
-    )
+    query_url = f"{base_url}?year=&year_month=&first_name=&last_name=&start_date={formatted_date}&end_date={formatted_date}&conflict=&home_state=&home_town="
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
+    
     try:
-        response = session.get(query_url, timeout=30)
-        if response.status_code != 200 or "Access Denied" in response.text or "Captcha" in response.text:
-            log.warning(f"Blocked or failed fetching {query_url} (Status: {response.status_code})")
-            return []
+        response = requests.get(query_url, headers=headers, proxies=proxies, timeout=30)
     except requests.RequestException as e:
-        log.error(f"Network error fetching {query_url}: {e}")
+        print(f"[!] Network error fetching {query_url}: {e}")
+        return []
+
+    if response.status_code != 200 or "Access Denied" in response.text or "Captcha" in response.text:
+        print(f"[!] Failed or blocked when fetching {query_url} (Status: {response.status_code})")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
     fallen_list = []
 
-    for entry in soup.select(".data-box"):
+    entries = soup.select(".data-box")
+    for entry in entries:
         name_tag = entry.select_one(".data-box-right h3 a")
         name = name_tag.text.strip() if name_tag else "Unknown"
+        
         date_tag = entry.select_one(".data-box-right .blue-bold")
         date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
-        profile_link = name_tag["href"].rstrip(':').rstrip() if name_tag and "href" in name_tag.attrs else ""
-        image_tag = entry.select_one(".data-box-left img")
+        
+        profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
+        # Clean up profile link - remove any trailing colons or extra characters
+        if profile_link:
+            profile_link = profile_link.rstrip(':').rstrip()
+        
+        image_tag = entry.select_one(".data-box-left img, .record-image img")
         image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
-        if image_url and image_url.startswith("/"):
-            image_url = f"https://thefallen.militarytimes.com{image_url}"
+        
+        # Check for S3 bucket URLs or make sure image URL is absolute
+        if image_url:
+            if image_url.startswith("https://s3.amazonaws.com/"):
+                # S3 URL is already absolute, use as-is
+                pass
+            elif image_url.startswith("/"):
+                image_url = f"https://thefallen.militarytimes.com{image_url}"
+        
+        # Also check for record-image div for higher quality S3 images
+        record_image_div = entry.select_one(".record-image")
+        if record_image_div and not image_url.startswith("https://s3.amazonaws.com/"):
+            record_img = record_image_div.select_one("img")
+            if record_img and record_img.get("src"):
+                potential_s3_url = record_img["src"]
+                if potential_s3_url.startswith("https://s3.amazonaws.com/"):
+                    image_url = potential_s3_url  # Prefer S3 URLs for better quality
+
         fallen_list.append({
             "name": name,
             "date": date_of_death,
             "link": profile_link,
             "image_url": image_url
         })
+
     return fallen_list
 
-def search_comprehensive_range(session, start_date, end_date):
-    """Search for all fallen service members in a date range."""
+def search_comprehensive_range(start_date, end_date):
+    """Search for all fallen service members in a date range"""
+    print(f"[*] Comprehensive search from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
+    
     all_service_members = []
-    for n in range((end_date - start_date).days + 1):
-        date = start_date + timedelta(days=n)
-        log.info(f"Searching {date.strftime('%m/%d/%Y')}...")
-        fallen = get_fallen_service_members(session, date)
-        for person in filter(lambda p: p["image_url"], fallen):
-            all_service_members.append(person)
-            log.info(f"  ✅ {person['name']} - {person['date']} (has photo)")
-        time.sleep(1)  # Rate limiting
+    current_date = start_date
+    
+    while current_date <= end_date:
+        print(f"[*] Searching {current_date.strftime('%m/%d/%Y')}...")
+        fallen = get_fallen_service_members(current_date)
+        
+        if fallen:
+            print(f"    Found {len(fallen)} service members")
+            for person in fallen:
+                if person["image_url"]:
+                    all_service_members.append(person)
+                    print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+        
+        current_date += timedelta(days=1)
+        time.sleep(1)  # Rate limiting for comprehensive search
+    
     return all_service_members
 
-def get_detailed_service_member_info(session, profile_link):
-    """Get detailed information from the service member's profile page."""
+def get_detailed_service_member_info(profile_link):
+    """Get detailed information from the service member's profile page"""
     if not profile_link:
         return {}
-
+    
+    # Clean the profile link - remove any trailing colons or whitespace
     profile_link = profile_link.rstrip(':').rstrip().lstrip('/')
     if not profile_link.startswith('/'):
         profile_link = '/' + profile_link
+    
     full_url = f"https://thefallen.militarytimes.com{profile_link}"
-
+    print(f"    → Fetching: {full_url}")  # Debug URL
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
+    
     try:
-        response = session.get(full_url, timeout=30)
+        response = requests.get(full_url, headers=headers, proxies=proxies, timeout=30)
         if response.status_code != 200:
-            log.warning(f"Failed to fetch profile: {full_url} (Status: {response.status_code})")
+            print(f"[!] Failed to fetch profile: {full_url} (Status: {response.status_code})")
             return {}
-
+        
         soup = BeautifulSoup(response.text, "html.parser")
-        content = soup.get_text()
         details = {}
-
-        # Age
+        
+        # Get all text content and parse it
+        content = soup.get_text()
+        
+        # Also check if there's a better quality S3 image URL in the profile
+        profile_image_div = soup.select_one(".record-image")
+        if profile_image_div:
+            profile_img = profile_image_div.select_one("img")
+            if profile_img and profile_img.get("src"):
+                s3_image_url = profile_img["src"]
+                if s3_image_url.startswith("https://s3.amazonaws.com/"):
+                    details["high_quality_image_url"] = s3_image_url
+                    print(f"    → Found S3 image: {s3_image_url}")
+        
+        # Extract age using regex
         age_match = re.search(r'Age:?\s*(\d+)', content, re.IGNORECASE)
-        if age_match: details["age"] = age_match.group(1)
-
-        # Rank
-        rank_pattern = r'\b(PVT|PFC|SPC|CPL|SGT|SSG|SFC|MSG|1SG|SGM|CSM|2LT|1LT|CPT|MAJ|LTC|COL|BG|MG|LTG|GEN|ENS|LTJG|LT|LCDR|CDR|CAPT|RDML|RADM|VADM|ADM|Airman|A1C|SrA|SSgt|TSgt|MSgt|SMSgt|CMSgt|2d Lt|1st Lt|Capt|Maj|Lt Col|Col|Brig Gen|Maj Gen|Lt Gen|Gen)\b'
+        if age_match:
+            details["age"] = age_match.group(1)
+        
+        # Extract rank - look for common military ranks
+        rank_pattern = r'\b(PVT|PFC|SPC|CPL|SGT|SSG|SFC|MSG|1SG|SGM|CSM|2LT|1LT|CPT|MAJ|LTC|COL|BG|MG|LTG|GEN|ENS|LTJG|LT|LCDR|CDR|CAPT|RDML|RADM|VADM|ADM|Airman|A1C|SrA|SSgt|TSgt|MSgt|SMSgt|CMSgt|2d Lt|1st Lt|Maj|Lt Col|Brig Gen|Maj Gen|Lt Gen|Pvt|Lance Cpl|Cpl|Sgt|Staff Sgt|Gunnery Sgt|Master Sgt|1st Sgt|Master Gunnery Sgt|Sgt Maj|2ndLt|1stLt|Capt|Major|Lt Colonel|Colonel|Brigadier General|Major General|Lieutenant General|General)\b'
         rank_match = re.search(rank_pattern, content, re.IGNORECASE)
-        if rank_match: details["rank"] = rank_match.group(1)
-
-        # Location
-        location_patterns = [
-            r'of ([^,\n]+(?:, [A-Z]{2})?)',
-            r'from ([^,\n]+(?:, [A-Z]{2})?)',
-            r'([A-Za-z\s]+, [A-Z]{2})'
-        ]
-        for pattern in location_patterns:
-            location_match = re.search(pattern, content)
-            if location_match:
-                location = location_match.group(1).strip()
-                if len(location) > 3 and not location.lower().startswith(('the', 'was', 'and', 'who')):
-                    details["location"] = location
-                    break
-
-        # Death location
+        if rank_match:
+            details["rank"] = rank_match.group(1)
+        
+        # Extract hometown/location (where they're from) - REMOVED DUE TO PARSING ISSUES
+        # Removed location extraction as it was causing incorrect state parsing
+        
+        # Extract location of death/incident (where they died)
         death_location_patterns = [
             r'killed in ([^,\n.]+(?:, [A-Za-z]+)?)',
             r'died in ([^,\n.]+(?:, [A-Za-z]+)?)',
@@ -150,6 +173,7 @@ def get_detailed_service_member_info(session, profile_link):
             r'province of ([A-Za-z\s]+)',
             r'near ([A-Za-z\s]+(?:, Iraq|, Afghanistan))'
         ]
+        
         for pattern in death_location_patterns:
             death_location_match = re.search(pattern, content, re.IGNORECASE)
             if death_location_match:
@@ -157,13 +181,14 @@ def get_detailed_service_member_info(session, profile_link):
                 if len(death_location) > 2 and not death_location.lower().startswith(('the', 'was', 'and', 'who', 'a ')):
                     details["death_location"] = death_location
                     break
-
-        # Branch
+        
+        # Extract branch of service
         branch_pattern = r'\b(Army|Navy|Marine Corps|Marines|Air Force|Coast Guard|Space Force)\b'
         branch_match = re.search(branch_pattern, content, re.IGNORECASE)
-        if branch_match: details["branch"] = branch_match.group(1)
-
-        # Unit
+        if branch_match:
+            details["branch"] = branch_match.group(1)
+        
+        # Get unit information - look for common unit patterns
         unit_patterns = [
             r'(\d+(?:st|nd|rd|th)?\s+[^,\n]{10,50}(?:Battalion|Regiment|Brigade|Division|Squadron|Wing|Group))',
             r'([A-Z][\w\s]*(Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^,\n]{0,30})'
@@ -173,269 +198,344 @@ def get_detailed_service_member_info(session, profile_link):
             if unit_match:
                 details["unit"] = unit_match.group(1).strip()
                 break
-
-        # Incident details
+        
+        # Extract circumstances/incident details
         incident_section = soup.select_one('.incident-details, .profile-details, .bio')
         if incident_section:
             incident_text = incident_section.get_text().strip()
             if len(incident_text) > 50:
+                # Truncate to first sentence or 200 characters
                 sentences = incident_text.split('.')
-                details["circumstances"] = (
-                    sentences[0] + "." if sentences and len(sentences[0]) < 200 else incident_text[:200] + "..."
-                )
+                if sentences and len(sentences[0]) < 200:
+                    details["circumstances"] = sentences[0] + "."
+                else:
+                    details["circumstances"] = incident_text[:200] + "..."
+        
         return details
-
+        
     except Exception as e:
-        log.error(f"Error getting details for {profile_link}: {e}")
+        print(f"[!] Error getting details for {profile_link}: {e}")
         return {}
 
-def resize_image_for_facebook(image_data):
-    """Resize image to optimal Facebook dimensions to prevent stretching."""
+def process_image_original_size(image_data):
+    """Process image maintaining original dimensions - no resizing"""
     try:
+        # Open image with PIL to ensure it's valid and convert if needed
         image = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if necessary (handles RGBA, P mode, etc.)
         if image.mode != 'RGB':
             image = image.convert('RGB')
-        target_size = (1200, 1200)
-        width, height = image.size
-        if width != height:
-            size = min(width, height)
-            left, top = (width - size) // 2, (height - size) // 2
-            right, bottom = left + size, top + size
-            image = image.crop((left, top, right, bottom))
-        resized_image = image.resize(target_size, Image.Resampling.LANCZOS)
+        
+        # Keep original dimensions - DO NOT RESIZE
+        print(f"    → Keeping original image size: {image.size[0]}x{image.size[1]}")
+        
+        # Save to bytes with high quality, maintaining original size
         output = io.BytesIO()
-        resized_image.save(output, format='JPEG', quality=98, optimize=True)
+        image.save(output, format='JPEG', quality=95, optimize=True)
         return output.getvalue()
+        
     except Exception as e:
-        log.error(f"Error resizing image: {e}")
-        return image_data
+        print(f"[!] Error processing image: {e}")
+        return image_data  # Return original if processing fails
 
-def test_facebook_credentials(session):
-    """Test if Facebook credentials are valid."""
+def test_facebook_credentials():
+    """Test if Facebook credentials are valid"""
+    print("[*] Testing Facebook credentials...")
+    
     if not ACCESS_TOKEN or not PAGE_ID:
-        log.error("Missing ACCESS_TOKEN or PAGE_ID")
+        print("❌ Missing ACCESS_TOKEN or PAGE_ID")
         return False
-
+    
+    # Test basic API access
     test_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}?access_token={ACCESS_TOKEN}"
+    
     try:
-        response = session.get(test_url, timeout=30)
+        response = requests.get(test_url, timeout=30)
+        
         if response.status_code == 200:
             page_info = response.json()
-            log.info(f"Connected to page: {page_info.get('name', 'Unknown')}")
+            print(f"✅ Successfully connected to page: {page_info.get('name', 'Unknown')}")
             return True
         else:
-            log.error(f"Failed to connect: {response.status_code} - {response.text}")
+            print(f"❌ Failed to connect: {response.status_code} - {response.text}")
             return False
     except Exception as e:
-        log.error(f"Error testing credentials: {e}")
+        print(f"❌ Error testing credentials: {e}")
         return False
 
-def fetch_profile_details_parallel(session, service_members):
-    """Fetch details for each person (parallelized)."""
-    details_list = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_person = {
-            executor.submit(get_detailed_service_member_info, session, person["link"]): person
-            for person in service_members
-        }
-        for future in as_completed(future_to_person):
-            person = future_to_person[future]
-            try:
-                details = future.result()
-                details_list.append((person, details))
-            except Exception as exc:
-                log.error(f"Error fetching details for {person['name']}: {exc}")
-    return details_list
-
-def download_and_resize_image(session, image_url):
-    """Download and resize image for Facebook."""
-    try:
-        response = session.get(image_url, timeout=30)
-        if response.status_code != 200 or len(response.content) < 1000:
-            return None
-        return resize_image_for_facebook(response.content)
-    except Exception as e:
-        log.error(f"Error downloading image {image_url}: {e}")
-        return None
-
-def upload_photos_to_album(session, service_member_details):
-    """Upload photos to Facebook without publishing, return photo IDs for album creation."""
-    log.info(f"Uploading {len(service_member_details)} photos to Facebook album...")
-    photo_ids = []
-    for i, (person, details) in enumerate(service_member_details, 1):
-        if not person["image_url"]:
-            log.warning(f"No image for {person['name']}, skipping...")
-            continue
-        log.info(f"Processing {i}/{len(service_member_details)}: {person['name']}")
-        image_data = download_and_resize_image(session, person["image_url"])
-        if not image_data:
-            log.warning(f"Failed to process image for {person['name']}")
-            continue
-        upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
-        files = {'source': ('hero_photo.jpg', image_data, 'image/jpeg')}
-        data = {
-            "access_token": ACCESS_TOKEN,
-            "published": "false",
-            "caption": f"{person['name']} - {person['date']}"
-        }
-        try:
-            response = session.post(upload_url, data=data, files=files, timeout=60)
-            if response.status_code == 200:
-                result = response.json()
-                photo_id = result.get("id")
-                if photo_id: photo_ids.append(photo_id)
-                log.info(f"Uploaded (Photo ID: {photo_id})")
-            else:
-                log.error(f"Facebook API error: {response.status_code} {response.text}")
-        except Exception as e:
-            log.error(f"Error uploading photo for {person['name']}: {e}")
-        if i < len(service_member_details):
-            time.sleep(2)
-    log.info(f"Uploaded {len(photo_ids)} out of {len(service_member_details)} photos")
-    return photo_ids
-
-def create_album_post_caption(service_member_details):
+def create_individual_hero_caption(person, details, hero_number, total_heroes):
+    """Create a caption for an individual hero post"""
     today = datetime.today()
-    caption = [
-        "🇺🇸 HONORING OUR FALLEN HEROES 🇺🇸",
-        f"📅 Service Members Who Made the Ultimate Sacrifice on {today.strftime('%B %d')}",
-        "",
-        "🎗️ TODAY WE REMEMBER:",
-        ""
-    ]
-    for i, (person, details) in enumerate(service_member_details, 1):
-        member_info = [f"#{i} {person['name'].upper()}"]
-        if details.get("rank") and details.get("branch"):
-            member_info.append(f"   🎖️ {details['branch']} {details['rank']}")
-        elif details.get("rank"):
-            member_info.append(f"   🎖️ {details['rank']}")
-        elif details.get("branch"):
-            member_info.append(f"   ⚔️ {details['branch']}")
-        if details.get("age"):
-            member_info.append(f"   👤 Age {details['age']}")
-        if details.get("location"):
-            member_info.append(f"   🏠 {details['location']}")
-        member_info.append(f"   📅 {person['date']}")
-        if details.get("death_location"):
-            member_info.append(f"   📍 {details['death_location']}")
-        caption.extend(member_info)
-        caption.append("")
-    caption.extend([
-        "🕊️ We will never forget their service and sacrifice.",
-        "🙏 Each of these heroes gave their life for our freedom.",
-        "⭐ True American heroes, all.",
-        "",
-        "🔗 Learn more about each hero:",
-        "https://thefallen.militarytimes.com/",
-        "",
-        "#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Heroes #Freedom #RememberThem"
-    ])
-    return "\n".join(caption)
+    caption_parts = []
+    
+    # Header with hero number
+    caption_parts.append("🇺🇸 HONORING OUR FALLEN HERO 🇺🇸")
+    caption_parts.append(f"📅 {today.strftime('%B %d')} Memorial - Hero {hero_number} of {total_heroes}")
+    caption_parts.append("")
+    
+    # Hero's name prominently displayed
+    caption_parts.append(f"🎗️ {person['name'].upper()}")
+    caption_parts.append("")
+    
+    # Military information in clean format
+    military_info = []
+    if details.get("rank") and details.get("branch"):
+        military_info.append(f"🎖️ {details['branch']} {details['rank']}")
+    elif details.get("rank"):
+        military_info.append(f"🎖️ {details['rank']}")
+    elif details.get("branch"):
+        military_info.append(f"⚔️ {details['branch']}")
+    
+    if details.get("unit"):
+        military_info.append(f"🏛️ {details['unit']}")
+    
+    if details.get("age"):
+        military_info.append(f"👤 Age {details['age']}")
+    
+    # Add military info
+    caption_parts.extend(military_info)
+    caption_parts.append("")
+    
+    # Sacrifice information
+    caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
+    if details.get("death_location"):
+        caption_parts.append(f"📍 Location: {details['death_location']}")
+    
+    caption_parts.append("")
+    
+    # Circumstances if available
+    if details.get("circumstances"):
+        caption_parts.append("💔 How They Served:")
+        caption_parts.append(details['circumstances'])
+        caption_parts.append("")
+    
+    # Footer
+    caption_parts.append("🕊️ We will never forget your service and sacrifice.")
+    caption_parts.append("🙏 Thank you for your ultimate sacrifice for our freedom.")
+    caption_parts.append("⭐ A true American hero.")
+    caption_parts.append("")
+    caption_parts.append(f"🔗 Learn more: https://thefallen.militarytimes.com{person['link'].rstrip(':').rstrip()}")
+    caption_parts.append("")
+    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero #Freedom")
+    
+    return "\n".join(caption_parts)
 
-def create_multi_photo_post(session, photo_ids, service_member_details):
-    """Create a single Facebook post with multiple photos."""
-    if not photo_ids:
-        log.warning("No photo IDs to create post with")
-        return False
-    log.info(f"Creating album post with {len(photo_ids)} photos...")
-    caption = create_album_post_caption(service_member_details)
-    attached_media = [{"media_fbid": photo_id} for photo_id in photo_ids]
-    post_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
-    post_data = {
-        "message": caption,
-        "attached_media": attached_media,
-        "access_token": ACCESS_TOKEN
-    }
-    try:
-        response = session.post(post_url, json=post_data, timeout=60)
-        if response.status_code == 200:
-            post_id = response.json().get("id", "unknown")
-            log.info(f"Successfully created album post (Post ID: {post_id})")
-            return True
-        else:
-            log.error(f"Failed to create album post: {response.status_code}\n{response.text}")
-            return False
-    except Exception as e:
-        log.error(f"Error creating album post: {e}")
-        return False
+def post_individual_heroes(service_members):
+    """Post individual photos with captions for each service member as separate feed posts"""
+    print(f"[*] Creating individual feed posts for {len(service_members)} heroes...")
+    successful_posts = 0
+    total_heroes = len(service_members)
+    
+    for i, person in enumerate(service_members, 1):
+        if not person["image_url"]:
+            print(f"[!] No image for {person['name']}, skipping...")
+            continue
+        
+        print(f"[*] Processing {i}/{total_heroes}: {person['name']}...")
+        
+        # Get detailed information
+        print(f"    → Fetching profile details...")
+        details = get_detailed_service_member_info(person["link"])
+        
+        # Use high-quality S3 image if available from profile, otherwise use original
+        image_url_to_use = details.get("high_quality_image_url", person["image_url"])
+        print(f"    → Using image: {image_url_to_use}")
+        
+        # Create individual hero caption
+        caption = create_individual_hero_caption(person, details, i, total_heroes)
+        
+        try:
+            # Download the image (prefer S3 URL if available)
+            print(f"    → Downloading image from source...")
+            proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
+            image_response = requests.get(image_url_to_use, proxies=proxies, timeout=30)
+            
+            if image_response.status_code != 200:
+                print(f"    ❌ Failed to download image (Status: {image_response.status_code})")
+                continue
+            
+            original_image_data = image_response.content
+            
+            # Validate image data
+            if len(original_image_data) < 1000:  # Less than 1KB is probably not a valid image
+                print(f"    ❌ Image file too small, likely invalid")
+                continue
+            
+            # Process image maintaining original size
+            print(f"    → Processing image at original size...")
+            processed_image_data = process_image_original_size(original_image_data)
+            
+            # STEP 1: Upload photo without publishing to get photo ID
+            print(f"    → Uploading photo to Facebook...")
+            upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
+            
+            files = {'source': ('hero_photo.jpg', processed_image_data, 'image/jpeg')}
+            upload_data = {
+                "access_token": ACCESS_TOKEN,
+                "published": "false",  # Don't publish yet
+                "caption": f"Memorial photo for {person['name']}"
+            }
+            
+            upload_response = requests.post(upload_url, data=upload_data, files=files, timeout=60)
+            
+            if upload_response.status_code != 200:
+                print(f"    ❌ Failed to upload photo: {upload_response.status_code}")
+                print(f"    Error: {upload_response.text}")
+                continue
+            
+            upload_result = upload_response.json()
+            photo_id = upload_result.get("id")
+            
+            if not photo_id:
+                print(f"    ❌ No photo ID returned from upload")
+                continue
+            
+            print(f"    ✅ Photo uploaded successfully (ID: {photo_id})")
+            
+            # STEP 2: Create individual feed post with the uploaded photo
+            print(f"    → Creating individual feed post...")
+            feed_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
+            
+            feed_data = {
+                "message": caption,
+                "object_attachment": photo_id,  # Attach the uploaded photo
+                "access_token": ACCESS_TOKEN
+            }
+            
+            feed_response = requests.post(feed_url, data=feed_data, timeout=60)
+            
+            if feed_response.status_code == 200:
+                feed_result = feed_response.json()
+                post_id = feed_result.get("id", "unknown")
+                print(f"    ✅ Successfully created individual post (Post ID: {post_id})")
+                successful_posts += 1
+                
+                # Add delay to ensure posts don't interfere with each other
+                if i < total_heroes:  # Don't delay after the last post
+                    print(f"    → Waiting 8 seconds before next hero...")
+                    time.sleep(8)  # Longer delay to ensure separation
+                
+            else:
+                print(f"    ❌ Failed to create feed post: {feed_response.status_code}")
+                print(f"    Error details: {feed_response.text}")
+                
+        except Exception as e:
+            print(f"    ❌ Error processing {person['name']}: {e}")
+            continue
+    
+    print(f"\n[*] ✅ Successfully created {successful_posts} individual posts out of {total_heroes} heroes")
+    return successful_posts
 
-def post_images_to_facebook(session, service_members):
-    """Upload photos and create a single album post with all service members."""
-    log.info(f"Creating memorial album with {len(service_members)} service members...")
-    service_member_details = fetch_profile_details_parallel(session, service_members)
-    photo_ids = upload_photos_to_album(session, service_member_details)
-    if not photo_ids:
-        log.error("No photos were uploaded successfully")
-        return 0
-    success = create_multi_photo_post(session, photo_ids, service_member_details)
-    if success:
-        log.info(f"Created memorial album post with {len(photo_ids)} heroes")
-        return len(photo_ids)
+def post_images_to_facebook(service_members):
+    """Create individual posts for each service member with their photo and information"""
+    print(f"[*] Creating individual memorial posts for {len(service_members)} service members...")
+    
+    # Create individual posts for each hero
+    success_count = post_individual_heroes(service_members)
+    
+    if success_count > 0:
+        print(f"\n✅ Successfully created {success_count} individual memorial posts")
+        return success_count
     else:
-        log.error("Failed to create album post")
+        print(f"\n❌ Failed to create memorial posts")
         return 0
 
 def main():
-    log.info("=" * 60)
-    log.info("🇺🇸 FALLEN HEROES MEMORIAL FACEBOOK POSTING SCRIPT 🇺🇸")
-    log.info("=" * 60)
-    log.info(f"ACCESS_TOKEN: {'Set' if ACCESS_TOKEN else 'NOT SET'}")
-    log.info(f"PAGE_ID: {'Set' if PAGE_ID else 'NOT SET'}")
-    log.info(f"USE_PROXY: {USE_PROXY}")
-    log.info(f"SEARCH_MODE: {SEARCH_MODE}")
+    """Main function"""
+    print("=" * 60)
+    print("🇺🇸 FALLEN HEROES MEMORIAL FACEBOOK POSTING SCRIPT 🇺🇸")
+    print("=" * 60)
+    
+    # Debug environment variables (don't print actual values for security)
+    print(f"ACCESS_TOKEN: {'✅ Set (' + str(len(ACCESS_TOKEN)) + ' chars)' if ACCESS_TOKEN else '❌ NOT SET'}")
+    print(f"PAGE_ID: {'✅ Set (' + PAGE_ID + ')' if PAGE_ID else '❌ NOT SET'}")
+    print(f"USE_PROXY: {USE_PROXY}")
+    print(f"SEARCH_MODE: {SEARCH_MODE}")
+    
     if not ACCESS_TOKEN or not PAGE_ID:
-        log.error("Missing required environment variables! Please set FB_ACCESS_TOKEN and FB_PAGE_ID")
+        print("\n❌ Missing required environment variables!")
+        print("Please set FB_ACCESS_TOKEN and FB_PAGE_ID")
         return 1
+    
+    # Validate PAGE_ID is numeric
     if not PAGE_ID.isdigit():
-        log.error(f"PAGE_ID should be numeric, got: {PAGE_ID}")
+        print(f"\n❌ PAGE_ID should be numeric, got: {PAGE_ID}")
         return 1
-    session = get_requests_session()
-    if not test_facebook_credentials(session):
-        log.error("Facebook credential test failed!")
+    
+    # Test credentials
+    if not test_facebook_credentials():
+        print("\n❌ Facebook credential test failed!")
         return 1
+    
     today = datetime.today()
     all_service_members = []
+    
     if SEARCH_MODE == "comprehensive":
+        # Search from Iraq invasion start date to present
         iraq_invasion_date = datetime(2003, 3, 20)
-        log.info(f"Comprehensive search: {iraq_invasion_date.strftime('%m/%d/%Y')} to {today.strftime('%m/%d/%Y')}")
-        all_service_members = search_comprehensive_range(session, iraq_invasion_date, today)
+        print(f"\n[*] 🔍 COMPREHENSIVE SEARCH: Iraq invasion ({iraq_invasion_date.strftime('%m/%d/%Y')}) to present...")
+        all_service_members = search_comprehensive_range(iraq_invasion_date, today)
+        
     elif SEARCH_MODE == "recent":
+        # Search last 30 days
         start_date = today - timedelta(days=30)
-        log.info(f"Recent search: Last 30 days ({start_date.strftime('%m/%d/%Y')} to {today.strftime('%m/%d/%Y')})")
-        all_service_members = search_comprehensive_range(session, start_date, today)
+        print(f"\n[*] 🔍 RECENT SEARCH: Last 30 days ({start_date.strftime('%m/%d/%Y')} to {today.strftime('%m/%d/%Y')})...")
+        all_service_members = search_comprehensive_range(start_date, today)
+        
     else:
-        search_years = list(range(2003, today.year + 1))
-        log.info(f"Daily search: Searching for fallen service members on {today.strftime('%B %d')} across multiple years...")
+        # Default: search today across multiple years
+        search_years = [2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+        print(f"\n[*] 🔍 DAILY SEARCH: Searching for fallen service members on {today.strftime('%B %d')} across multiple years...")
+        
         for year in search_years:
             try:
                 search_date = today.replace(year=year)
-                log.info(f"Checking {search_date.strftime('%B %d, %Y')}...")
-                fallen = get_fallen_service_members(session, search_date)
-                for person in filter(lambda p: p["image_url"], fallen):
-                    all_service_members.append(person)
-                    log.info(f"  ✅ {person['name']} - {person['date']} (has photo)")
-                time.sleep(1)
+                print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')}...")
+                
+                fallen = get_fallen_service_members(search_date)
+                
+                if fallen:
+                    print(f"    Found {len(fallen)} service members")
+                    # Only add those with images
+                    for person in fallen:
+                        if person["image_url"]:
+                            all_service_members.append(person)
+                            print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+                        else:
+                            print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
+                else:
+                    print(f"    No service members found")
+                    
+                time.sleep(1)  # Rate limiting
+                
             except ValueError:
-                log.info(f"Skipping {year} (date doesn't exist)")
+                # Handle leap year issues (Feb 29)
+                print(f"    Skipping {year} (date doesn't exist)")
                 continue
-    log.info("=" * 60)
+
+    print(f"\n" + "=" * 60)
+    
     if all_service_members:
-        log.info(f"Found {len(all_service_members)} service members with photos")
-        log.info("Starting Facebook album creation process...")
-        log.info("=" * 60)
-        success_count = post_images_to_facebook(session, all_service_members)
-        log.info("=" * 60)
+        print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
+        print(f"🚀 Starting individual Facebook memorial posts...")
+        print("=" * 60)
+        
+        success_count = post_images_to_facebook(all_service_members)
+        
+        print("\n" + "=" * 60)
         if success_count > 0:
-            log.info(f"COMPLETED: Successfully created memorial album with {success_count} heroes")
+            print(f"✅ COMPLETED: Successfully created {success_count} individual memorial posts")
         else:
-            log.error("FAILED: No memorial album was created")
-        log.info("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
-        log.info("=" * 60)
+            print("❌ FAILED: No memorial posts were created")
+        print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
+        print("=" * 60)
+        
         return 0 if success_count > 0 else 1
     else:
-        log.info("No fallen service members with images found for this search.")
-        log.info("🇺🇸 We honor all who have served 🇺🇸")
-        log.info("=" * 60)
+        print("📭 No fallen service members with images found for this search.")
+        print("🇺🇸 We honor all who have served 🇺🇸")
+        print("=" * 60)
         return 0
 
 if __name__ == "__main__":

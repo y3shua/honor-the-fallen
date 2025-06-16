@@ -538,6 +538,7 @@ def post_individual_heroes(service_members):
     return successful_posts
 
 def post_images_to_facebook(service_members):
+<<<<<<< HEAD
     """Select one random service member and create a single memorial post"""
     if not service_members:
         print("❌ No service members to post")
@@ -558,6 +559,19 @@ def post_images_to_facebook(service_members):
         return success_count
     else:
         print(f"\n❌ Failed to create memorial post")
+=======
+    """Create individual posts for each service member with their photo and information"""
+    print(f"[*] Creating individual memorial posts for {len(service_members)} service members...")
+    
+    # Create individual posts for each hero
+    success_count = post_individual_heroes(service_members)
+    
+    if success_count > 0:
+        print(f"\n✅ Successfully created {success_count} individual memorial posts")
+        return success_count
+    else:
+        print(f"\n❌ Failed to create memorial posts")
+>>>>>>> ab736e6 (ignore non unit words)
         return 0
 
 def main():
@@ -637,17 +651,27 @@ def main():
     
     if all_service_members:
         print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
+<<<<<<< HEAD
         print(f"🎯 Will randomly select 1 hero for today's memorial")
         print(f"🚀 Selecting random hero for today's memorial...")
+=======
+        print(f"🚀 Starting individual Facebook memorial posts...")
+>>>>>>> ab736e6 (ignore non unit words)
         print("=" * 60)
         
         success_count = post_images_to_facebook(all_service_members)
         
         print("\n" + "=" * 60)
         if success_count > 0:
+<<<<<<< HEAD
             print(f"✅ COMPLETED: Successfully created today's memorial post")
         else:
             print("❌ FAILED: No memorial post was created")
+=======
+            print(f"✅ COMPLETED: Successfully created {success_count} individual memorial posts")
+        else:
+            print("❌ FAILED: No memorial posts were created")
+>>>>>>> ab736e6 (ignore non unit words)
         print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
         print("=" * 60)
         

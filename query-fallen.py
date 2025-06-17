@@ -607,11 +607,59 @@ def post_individual_heroes(service_members):
             # Download the image (prefer S3 URL if available)
             print(f"    → Downloading image from source...")
             proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
-            image_response = requests.get(image_url_to_use, proxies=proxies, timeout=30)
+            
+            # Use proper headers to avoid 403 blocking
+            image_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            
+            # Try downloading with proper headers
+            image_response = requests.get(image_url_to_use, headers=image_headers, proxies=proxies, timeout=30)
+            
+            if image_response.status_code == 403:
+                print(f"    ⚠️  403 Forbidden - trying alternative approach...")
+                
+                # Try without some headers that might trigger blocking
+                simple_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+                image_response = requests.get(image_url_to_use, headers=simple_headers, proxies=proxies, timeout=30)
+                
+                if image_response.status_code == 403:
+                    print(f"    ⚠️  Still 403 - trying with session and referer...")
+                    
+                    # Create a session and add referer
+                    session = requests.Session()
+                    session.headers.update({
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://thefallen.militarytimes.com/"
+                    })
+                    
+                    image_response = session.get(image_url_to_use, proxies=proxies, timeout=30)
             
             if image_response.status_code != 200:
                 print(f"    ❌ Failed to download image (Status: {image_response.status_code})")
-                continue
+                print(f"    ❌ URL: {image_url_to_use}")
+                print(f"    ❌ Response: {image_response.text[:200]}...")
+                
+                # Try to find alternative image URL from the profile page
+                if details.get("high_quality_image_url") and image_url_to_use != person["image_url"]:
+                    print(f"    → Trying fallback to original image URL...")
+                    fallback_response = requests.get(person["image_url"], headers=image_headers, proxies=proxies, timeout=30)
+                    if fallback_response.status_code == 200:
+                        image_response = fallback_response
+                        print(f"    ✅ Fallback image downloaded successfully")
+                    else:
+                        print(f"    ❌ Fallback also failed: {fallback_response.status_code}")
+                        continue
+                else:
+                    continue
             
             original_image_data = image_response.content
             

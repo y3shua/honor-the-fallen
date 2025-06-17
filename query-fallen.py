@@ -610,37 +610,10 @@ def post_individual_heroes(service_members):
     return successful_posts
 
 def post_images_to_facebook(service_members):
-<<<<<<< HEAD
-<<<<<<< HEAD
-    """Select one random service member and create a single memorial post"""
-    if not service_members:
-        print("❌ No service members to post")
-        return 0
-    
-    import random
-    
-    # Select one random hero for today's memorial
-    selected_hero = random.choice(service_members)
-    print(f"[*] Selected hero of the day: {selected_hero['name']}")
-    print(f"[*] Creating single memorial post...")
-    
-    # Create individual post for the selected hero
-    success_count = post_individual_heroes([selected_hero])  # Pass as single-item list
-    
-    if success_count > 0:
-        print(f"\n✅ Successfully created memorial post for {selected_hero['name']}")
-        return success_count
-    else:
-        print(f"\n❌ Failed to create memorial post")
-=======
-    """Create individual posts for each service member with their photo and information"""
-    print(f"[*] Creating individual memorial posts for {len(service_members)} service members...")
-=======
     """Select one random unposted service member and create a single memorial post"""
     if not service_members:
         print("❌ No service members to post")
         return 0
->>>>>>> 6df6449 (fixed formatting issues)
     
     # Select an unposted hero for today's memorial
     selected_hero = select_unposted_hero(service_members)
@@ -658,12 +631,7 @@ def post_images_to_facebook(service_members):
         print(f"\n✅ Successfully created memorial post for {selected_hero['name']}")
         return success_count
     else:
-<<<<<<< HEAD
-        print(f"\n❌ Failed to create memorial posts")
->>>>>>> ab736e6 (ignore non unit words)
-=======
         print(f"\n❌ Failed to create memorial post")
->>>>>>> 6df6449 (fixed formatting issues)
         return 0
 
 def main():
@@ -771,38 +739,17 @@ def main():
     
     if all_service_members:
         print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
-<<<<<<< HEAD
-<<<<<<< HEAD
         print(f"🎯 Will randomly select 1 hero for today's memorial")
         print(f"🚀 Selecting random hero for today's memorial...")
-=======
-        print(f"🚀 Starting individual Facebook memorial posts...")
->>>>>>> ab736e6 (ignore non unit words)
-=======
-        print(f"🎯 Will randomly select 1 hero for today's memorial")
-        print(f"🚀 Selecting random hero for today's memorial...")
->>>>>>> 6df6449 (fixed formatting issues)
         print("=" * 60)
         
         success_count = post_images_to_facebook(all_service_members)
         
         print("\n" + "=" * 60)
         if success_count > 0:
-<<<<<<< HEAD
-<<<<<<< HEAD
             print(f"✅ COMPLETED: Successfully created today's memorial post")
         else:
             print("❌ FAILED: No memorial post was created")
-=======
-            print(f"✅ COMPLETED: Successfully created {success_count} individual memorial posts")
-        else:
-            print("❌ FAILED: No memorial posts were created")
->>>>>>> ab736e6 (ignore non unit words)
-=======
-            print(f"✅ COMPLETED: Successfully created today's memorial post")
-        else:
-            print("❌ FAILED: No memorial post was created")
->>>>>>> 6df6449 (fixed formatting issues)
         print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
         print("=" * 60)
         

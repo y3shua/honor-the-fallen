@@ -391,26 +391,34 @@ def get_detailed_service_member_info(profile_link):
         return {}
 
 def process_image_original_size(image_data):
-    """Process image maintaining original dimensions - no resizing"""
+    """Process image maintaining exact original dimensions - no modifications at all"""
     try:
-        # Open image with PIL to ensure it's valid and convert if needed
+        # Open image with PIL to validate it's a proper image
         image = Image.open(io.BytesIO(image_data))
         
-        # Convert to RGB if necessary (handles RGBA, P mode, etc.)
-        if image.mode != 'RGB':
+        # Get original dimensions
+        original_width, original_height = image.size
+        print(f"    → Original image dimensions: {original_width}x{original_height}")
+        
+        # For 125x200 military portrait photos, keep EXACTLY as-is
+        # No resizing, no cropping, no modifications whatsoever
+        
+        # Only convert color mode if absolutely necessary for Facebook compatibility
+        if image.mode not in ['RGB', 'RGBA']:
+            print(f"    → Converting from {image.mode} to RGB for compatibility")
             image = image.convert('RGB')
         
-        # Keep original dimensions - DO NOT RESIZE
-        print(f"    → Keeping original image size: {image.size[0]}x{image.size[1]}")
-        
-        # Save to bytes with high quality, maintaining original size
+        # Save with maximum quality and original dimensions
         output = io.BytesIO()
-        image.save(output, format='JPEG', quality=95, optimize=True)
+        image.save(output, format='JPEG', quality=100, optimize=False)
+        
+        print(f"    → Preserved exact dimensions: {original_width}x{original_height}")
         return output.getvalue()
         
     except Exception as e:
         print(f"[!] Error processing image: {e}")
-        return image_data  # Return original if processing fails
+        print(f"    → Returning original image data unchanged")
+        return image_data  # Return original if any processing fails
 
 def test_facebook_credentials():
     """Load the list of previously posted heroes from file"""
@@ -612,9 +620,35 @@ def post_individual_heroes(service_members):
                 print(f"    ❌ Image file too small, likely invalid")
                 continue
             
-            # Process image maintaining original size
-            print(f"    → Processing image at original size...")
-            processed_image_data = process_image_original_size(original_image_data)
+            # Process image maintaining exact original size (125x200)
+            print(f"    → Processing image - preserving exact original dimensions...")
+            
+            # Check if we should skip processing entirely for better quality
+            skip_processing = os.getenv("SKIP_IMAGE_PROCESSING", "false").lower() == "true"
+            
+            if skip_processing:
+                print(f"    → Skipping image processing - using original file")
+                processed_image_data = original_image_data
+            else:
+                processed_image_data = process_image_original_size(original_image_data)
+                
+                # Verify we didn't accidentally change dimensions
+                try:
+                    test_image = Image.open(io.BytesIO(processed_image_data))
+                    processed_size = test_image.size
+                    original_test = Image.open(io.BytesIO(original_image_data))
+                    original_size = original_test.size
+                    
+                    if processed_size != original_size:
+                        print(f"    ⚠️  Warning: Dimensions changed! Using original instead")
+                        print(f"    Original: {original_size}, Processed: {processed_size}")
+                        processed_image_data = original_image_data
+                    else:
+                        print(f"    ✅ Verified dimensions preserved: {processed_size}")
+                except:
+                    # If verification fails, use original to be safe
+                    print(f"    → Using original image data to be safe")
+                    processed_image_data = original_image_data
             
             # Create unique filename to prevent any potential overwrites
             timestamp = str(int(time.time()))

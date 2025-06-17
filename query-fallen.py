@@ -657,9 +657,21 @@ def main():
         return 1
     
     # Test credentials
-    if not test_facebook_credentials():
+    credential_test_passed = test_facebook_credentials()
+    if not credential_test_passed:
         print("\n❌ Facebook credential test failed!")
-        return 1
+        
+        # Check if we should continue anyway (useful for testing or temporary issues)
+        continue_anyway = os.getenv("CONTINUE_WITHOUT_FB_TEST", "false").lower() == "true"
+        if continue_anyway:
+            print("⚠️  CONTINUE_WITHOUT_FB_TEST=true, proceeding anyway...")
+        else:
+            print("💡 Set CONTINUE_WITHOUT_FB_TEST=true to bypass this check")
+            print("💡 Common fixes:")
+            print("   - Regenerate your Facebook access token")
+            print("   - Verify PAGE_ID is correct (numeric)")
+            print("   - Check token permissions include 'pages_manage_posts'")
+            return 1
     
     today = datetime.today()
     all_service_members = []

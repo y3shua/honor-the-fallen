@@ -13,6 +13,8 @@ import time
 import re
 from PIL import Image, ImageDraw, ImageFont
 import io
+import json
+import hashlib
 
 # Environment variables
 ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
@@ -219,7 +221,8 @@ def get_detailed_service_member_info(profile_link):
                     if unit_match:
                         unit = unit_match.group(1).strip()
                         # Filter out non-military units like publisher information
-                        if not any(exclude in unit for exclude in ['Sightline Media Group', 'Military Times', 'Stars and Stripes']):
+                        exclude_terms = ['Sightline Media Group', 'Military Times', 'Stars and Stripes', '2018 Sightline Media Group', '2019 Sightline Media Group', '2020 Sightline Media Group', '2021 Sightline Media Group', '2022 Sightline Media Group', '2023 Sightline Media Group', '2024 Sightline Media Group', '2025 Sightline Media Group']
+                        if not any(exclude in unit for exclude in exclude_terms):
                             details["unit"] = unit
                             print(f"    → Found unit: {unit}")
                         else:
@@ -229,12 +232,14 @@ def get_detailed_service_member_info(profile_link):
                     if len(parts) > 1:
                         circumstances_part = parts[-1].strip()
                         if len(circumstances_part) > 20:  # Only if substantial content
-                            # Clean up the circumstances
+                            # Clean up the circumstances and capitalize first letter
                             circumstances = circumstances_part.rstrip('.')
-                            if not circumstances.endswith('.'):
-                                circumstances += '.'
-                            details["circumstances"] = circumstances
-                            print(f"    → Found circumstances: {circumstances}")
+                            if circumstances:
+                                circumstances = circumstances[0].upper() + circumstances[1:] if len(circumstances) > 1 else circumstances.upper()
+                                if not circumstances.endswith('.'):
+                                    circumstances += '.'
+                                details["circumstances"] = circumstances
+                                print(f"    → Found circumstances: {circumstances}")
             
             # Fallback: try to find the first <p> after record-txt if no <hr> content
             if not details.get("age"):
@@ -339,6 +344,73 @@ def process_image_original_size(image_data):
         return image_data  # Return original if processing fails
 
 def test_facebook_credentials():
+    """Load the list of previously posted heroes from file"""
+    posted_file = "posted_heroes.json"
+    if os.path.exists(posted_file):
+        try:
+            with open(posted_file, 'r') as f:
+                data = json.load(f)
+                return set(data.get('posted_heroes', []))
+        except Exception as e:
+            print(f"[!] Error loading posted heroes file: {e}")
+    return set()
+
+def save_posted_heroes(posted_heroes):
+    """Save the list of posted heroes to file"""
+    posted_file = "posted_heroes.json"
+    try:
+        data = {'posted_heroes': list(posted_heroes)}
+        with open(posted_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"[*] Saved {len(posted_heroes)} posted heroes to tracking file")
+    except Exception as e:
+        print(f"[!] Error saving posted heroes file: {e}")
+
+def create_hero_id(person):
+    """Create a unique ID for a hero based on name and date"""
+    # Use name and date to create unique identifier
+    hero_string = f"{person['name']}_{person['date']}"
+    return hashlib.md5(hero_string.encode()).hexdigest()
+
+def select_unposted_hero(service_members):
+    """Select a random hero who hasn't been posted before"""
+    if not service_members:
+        return None
+    
+    # Load previously posted heroes
+    posted_heroes = load_posted_heroes()
+    print(f"[*] Found {len(posted_heroes)} previously posted heroes")
+    
+    # Filter out already posted heroes
+    unposted_heroes = []
+    for hero in service_members:
+        hero_id = create_hero_id(hero)
+        if hero_id not in posted_heroes:
+            unposted_heroes.append(hero)
+        else:
+            print(f"[*] Skipping already posted hero: {hero['name']}")
+    
+    print(f"[*] Found {len(unposted_heroes)} unposted heroes out of {len(service_members)} total")
+    
+    if not unposted_heroes:
+        print("[!] All heroes for this date have been posted before!")
+        print("[*] Will reset tracking and start over with random selection...")
+        # Reset the tracking file and use all heroes
+        posted_heroes.clear()
+        save_posted_heroes(posted_heroes)
+        unposted_heroes = service_members
+    
+    # Select random hero from unposted list
+    import random
+    selected_hero = random.choice(unposted_heroes)
+    
+    # Mark this hero as posted
+    hero_id = create_hero_id(selected_hero)
+    posted_heroes.add(hero_id)
+    save_posted_heroes(posted_heroes)
+    
+    print(f"[*] Selected unposted hero: {selected_hero['name']} - {selected_hero['date']}")
+    return selected_hero
     """Test if Facebook credentials are valid"""
     print("[*] Testing Facebook credentials...")
     
@@ -539,6 +611,7 @@ def post_individual_heroes(service_members):
 
 def post_images_to_facebook(service_members):
 <<<<<<< HEAD
+<<<<<<< HEAD
     """Select one random service member and create a single memorial post"""
     if not service_members:
         print("❌ No service members to post")
@@ -562,16 +635,35 @@ def post_images_to_facebook(service_members):
 =======
     """Create individual posts for each service member with their photo and information"""
     print(f"[*] Creating individual memorial posts for {len(service_members)} service members...")
+=======
+    """Select one random unposted service member and create a single memorial post"""
+    if not service_members:
+        print("❌ No service members to post")
+        return 0
+>>>>>>> 6df6449 (fixed formatting issues)
     
-    # Create individual posts for each hero
-    success_count = post_individual_heroes(service_members)
+    # Select an unposted hero for today's memorial
+    selected_hero = select_unposted_hero(service_members)
+    
+    if not selected_hero:
+        print("❌ No suitable hero found for posting")
+        return 0
+    
+    print(f"[*] Creating memorial post for hero of the day: {selected_hero['name']}")
+    
+    # Create individual post for the selected hero
+    success_count = post_individual_heroes([selected_hero])  # Pass as single-item list
     
     if success_count > 0:
-        print(f"\n✅ Successfully created {success_count} individual memorial posts")
+        print(f"\n✅ Successfully created memorial post for {selected_hero['name']}")
         return success_count
     else:
+<<<<<<< HEAD
         print(f"\n❌ Failed to create memorial posts")
 >>>>>>> ab736e6 (ignore non unit words)
+=======
+        print(f"\n❌ Failed to create memorial post")
+>>>>>>> 6df6449 (fixed formatting issues)
         return 0
 
 def main():
@@ -646,23 +738,57 @@ def main():
                 # Handle leap year issues (Feb 29)
                 print(f"    Skipping {year} (date doesn't exist)")
                 continue
+        
+        # Special handling for June 16, 2025 - also search some additional years for more options
+        if today.month == 6 and today.day == 16:
+            print(f"\n[*] 🔍 SPECIAL: Additional search for June 16 across extended years...")
+            extended_years = [2001, 2002, 2026, 2027]  # Add some extra years for more options
+            for year in extended_years:
+                try:
+                    search_date = datetime(year, 6, 16)
+                    print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')} (extended search)...")
+                    
+                    fallen = get_fallen_service_members(search_date)
+                    
+                    if fallen:
+                        print(f"    Found {len(fallen)} service members")
+                        for person in fallen:
+                            if person["image_url"]:
+                                all_service_members.append(person)
+                                print(f"    ✅ {person['name']} - {person['date']} (has photo)")
+                            else:
+                                print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
+                    else:
+                        print(f"    No service members found")
+                        
+                    time.sleep(1)  # Rate limiting
+                    
+                except Exception as e:
+                    print(f"    Error searching {year}: {e}")
+                    continue
 
     print(f"\n" + "=" * 60)
     
     if all_service_members:
         print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
 <<<<<<< HEAD
+<<<<<<< HEAD
         print(f"🎯 Will randomly select 1 hero for today's memorial")
         print(f"🚀 Selecting random hero for today's memorial...")
 =======
         print(f"🚀 Starting individual Facebook memorial posts...")
 >>>>>>> ab736e6 (ignore non unit words)
+=======
+        print(f"🎯 Will randomly select 1 hero for today's memorial")
+        print(f"🚀 Selecting random hero for today's memorial...")
+>>>>>>> 6df6449 (fixed formatting issues)
         print("=" * 60)
         
         success_count = post_images_to_facebook(all_service_members)
         
         print("\n" + "=" * 60)
         if success_count > 0:
+<<<<<<< HEAD
 <<<<<<< HEAD
             print(f"✅ COMPLETED: Successfully created today's memorial post")
         else:
@@ -672,6 +798,11 @@ def main():
         else:
             print("❌ FAILED: No memorial posts were created")
 >>>>>>> ab736e6 (ignore non unit words)
+=======
+            print(f"✅ COMPLETED: Successfully created today's memorial post")
+        else:
+            print("❌ FAILED: No memorial post was created")
+>>>>>>> 6df6449 (fixed formatting issues)
         print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
         print("=" * 60)
         

@@ -23,6 +23,75 @@ USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
 PROXY = os.getenv("PROXY_URL")
 SEARCH_MODE = os.getenv("SEARCH_MODE", "daily")  # daily, comprehensive, or date_range
 
+def load_posted_heroes():
+    """Load the list of previously posted heroes from file"""
+    posted_file = "posted_heroes.json"
+    if os.path.exists(posted_file):
+        try:
+            with open(posted_file, 'r') as f:
+                data = json.load(f)
+                return set(data.get('posted_heroes', []))
+        except Exception as e:
+            print(f"[!] Error loading posted heroes file: {e}")
+    return set()
+
+def save_posted_heroes(posted_heroes):
+    """Save the list of posted heroes to file"""
+    posted_file = "posted_heroes.json"
+    try:
+        data = {'posted_heroes': list(posted_heroes)}
+        with open(posted_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"[*] Saved {len(posted_heroes)} posted heroes to tracking file")
+    except Exception as e:
+        print(f"[!] Error saving posted heroes file: {e}")
+
+def create_hero_id(person):
+    """Create a unique ID for a hero based on name and date"""
+    # Use name and date to create unique identifier
+    hero_string = f"{person['name']}_{person['date']}"
+    return hashlib.md5(hero_string.encode()).hexdigest()
+
+def select_unposted_hero(service_members):
+    """Select a random hero who hasn't been posted before"""
+    if not service_members:
+        return None
+    
+    # Load previously posted heroes
+    posted_heroes = load_posted_heroes()
+    print(f"[*] Found {len(posted_heroes)} previously posted heroes")
+    
+    # Filter out already posted heroes
+    unposted_heroes = []
+    for hero in service_members:
+        hero_id = create_hero_id(hero)
+        if hero_id not in posted_heroes:
+            unposted_heroes.append(hero)
+        else:
+            print(f"[*] Skipping already posted hero: {hero['name']}")
+    
+    print(f"[*] Found {len(unposted_heroes)} unposted heroes out of {len(service_members)} total")
+    
+    if not unposted_heroes:
+        print("[!] All heroes for this date have been posted before!")
+        print("[*] Will reset tracking and start over with random selection...")
+        # Reset the tracking file and use all heroes
+        posted_heroes.clear()
+        save_posted_heroes(posted_heroes)
+        unposted_heroes = service_members
+    
+    # Select random hero from unposted list
+    import random
+    selected_hero = random.choice(unposted_heroes)
+    
+    # Mark this hero as posted
+    hero_id = create_hero_id(selected_hero)
+    posted_heroes.add(hero_id)
+    save_posted_heroes(posted_heroes)
+    
+    print(f"[*] Selected unposted hero: {selected_hero['name']} - {selected_hero['date']}")
+    return selected_hero
+
 def get_fallen_service_members(date):
     """Query fallen service members for a specific date"""
     base_url = "https://thefallen.militarytimes.com/search"

@@ -286,16 +286,35 @@ def get_detailed_service_member_info(profile_link):
                             print(f"    → Found hometown: {hometown}")
                     
                     # Extract unit assignment (after "assigned to")
+                    # Look for pattern: "assigned to [unit]" which comes after city, state
                     unit_match = re.search(r'assigned to (?:the\s+)?([^;,]+(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;]*)', content_text, re.IGNORECASE)
                     if unit_match:
                         unit = unit_match.group(1).strip()
-                        # Filter out non-military units like publisher information
-                        exclude_terms = ['Sightline Media Group', 'Military Times', 'Stars and Stripes', '2018 Sightline Media Group', '2019 Sightline Media Group', '2020 Sightline Media Group', '2021 Sightline Media Group', '2022 Sightline Media Group', '2023 Sightline Media Group', '2024 Sightline Media Group', '2025 Sightline Media Group']
-                        if not any(exclude in unit for exclude in exclude_terms):
+                        
+                        # Completely ignore anything with Sightline Media Group
+                        if "Sightline Media Group" not in unit:
                             details["unit"] = unit
                             print(f"    → Found unit: {unit}")
                         else:
-                            print(f"    → Ignored non-military unit: {unit}")
+                            print(f"    → Ignored Sightline Media Group reference")
+                    
+                    # Alternative pattern: look for military unit keywords after location
+                    if not details.get("unit"):
+                        # Look for units that come after city/state pattern
+                        alt_unit_patterns = [
+                            r'(?:assigned to|with|of) (?:the\s+)?(\d+(?:st|nd|rd|th)?\s+[^;,]*(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;,]*)',
+                            r'(?:assigned to|with|of) (?:the\s+)?([A-Z][^;,]*(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;,]*)'
+                        ]
+                        
+                        for pattern in alt_unit_patterns:
+                            alt_match = re.search(pattern, content_text, re.IGNORECASE)
+                            if alt_match:
+                                alt_unit = alt_match.group(1).strip()
+                                # Still filter out Sightline
+                                if "Sightline Media Group" not in alt_unit and len(alt_unit) > 5:
+                                    details["unit"] = alt_unit
+                                    print(f"    → Found unit (alt pattern): {alt_unit}")
+                                    break
                     
                     # Extract circumstances of death (usually after the last semicolon)
                     if len(parts) > 1:

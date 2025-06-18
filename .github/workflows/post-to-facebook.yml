@@ -69,7 +69,7 @@ jobs:
         echo "🇺🇸 Starting Fallen Heroes Memorial Script 🇺🇸"
         echo "Search Mode: $SEARCH_MODE"
         echo "Timestamp: $(date)"
-        python query-fallen.py
+        python soldier-fb.py
         
     - name: Upload logs on failure
       if: failure()

@@ -132,8 +132,8 @@ class MilitaryTimesScraper:
     
     def get_fallen_service_members_basic(self, date):
         """
-        Get basic hero info (name, link, image URL) WITHOUT downloading images.
-        This is just for collecting references to pick from randomly.
+        Get basic hero info (name, link) WITHOUT trying to get images from search results.
+        Images will be obtained later from individual profile pages.
         """
         base_url = "https://thefallen.militarytimes.com/search"
         formatted_date = date.strftime("%m%%2F%d%%2F%Y")
@@ -185,31 +185,12 @@ class MilitaryTimesScraper:
                         if profile_link.startswith('/'):
                             profile_link = f"https://thefallen.militarytimes.com{profile_link}"
                     
-                    # Get image URL but DON'T download it yet
-                    image_tag = entry.select_one(".data-box-left img, .record-image img")
-                    image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
-                    
-                    if image_url:
-                        if image_url.startswith("https://s3.amazonaws.com/"):
-                            pass  # S3 URL is already absolute
-                        elif image_url.startswith("/"):
-                            image_url = f"https://thefallen.militarytimes.com{image_url}"
-                    
-                    # Check for higher quality S3 images
-                    record_image_div = entry.select_one(".record-image")
-                    if record_image_div and not image_url.startswith("https://s3.amazonaws.com/"):
-                        record_img = record_image_div.select_one("img")
-                        if record_img and record_img.get("src"):
-                            potential_s3_url = record_img["src"]
-                            if potential_s3_url.startswith("https://s3.amazonaws.com/"):
-                                image_url = potential_s3_url  # Prefer S3 URLs
-                    
-                    if name and name != "Unknown":
+                    if name and name != "Unknown" and profile_link:
                         fallen_list.append({
                             "name": name,
                             "date": date_of_death,
                             "link": profile_link,
-                            "image_url": image_url
+                            "image_url": None  # Will be obtained from profile page
                         })
                     
                 except Exception as e:
@@ -340,27 +321,27 @@ class MilitaryTimesScraper:
     def scrape_hero_profile(self, profile_url):
         """
         Scrape detailed information from a hero's profile page.
+        ONLY get the S3 image URL from the profile page.
         """
         try:
-            response = self.session.get(profile_url)
+            print(f"🔍 Scraping profile: {profile_url}")
+            response = self.session.get(profile_url, timeout=30)
             if response.status_code != 200:
+                print(f"⚠️ Profile page returned HTTP {response.status_code}")
                 return None
             
             soup = BeautifulSoup(response.content, 'html.parser')
             
             # Extract hero information
             hero_data = {
-                'profile_url': profile_url,
-                'name': self.extract_name(soup),
                 'rank': self.extract_rank(soup),
                 'age': self.extract_age(soup),
                 'hometown': self.extract_hometown(soup),
                 'branch': self.extract_branch(soup),
                 'unit': self.extract_unit(soup),
-                'date_of_death': self.extract_date_of_death(soup),
                 'location': self.extract_location(soup),
                 'circumstances': self.extract_circumstances(soup),
-                'image_url': self.extract_image_url(soup)
+                'image_url': self.extract_s3_image_url(soup)  # Only look for S3 images
             }
             
             return hero_data
@@ -368,6 +349,50 @@ class MilitaryTimesScraper:
         except Exception as e:
             print(f"❌ Error scraping profile {profile_url}: {str(e)}")
             return None
+    
+    def extract_s3_image_url(self, soup):
+        """
+        Extract ONLY S3 image URLs from the profile page using the exact structure:
+        <div class="content-div">
+            <div class="record-image">
+                <img src="https://s3.amazonaws.com/static.militarytimes.com/thefallen/hero_name_lg.jpg" width="125">
+        """
+        # Look specifically for the content-div > record-image > img structure
+        content_div = soup.select_one(".content-div")
+        if content_div:
+            record_image_div = content_div.select_one(".record-image")
+            if record_image_div:
+                img_tag = record_image_div.select_one("img")
+                if img_tag and img_tag.get("src"):
+                    src = img_tag.get("src")
+                    if src.startswith("https://s3.amazonaws.com/static.militarytimes.com/thefallen/"):
+                        print(f"✅ Found S3 image in content-div > record-image: {src}")
+                        return src
+                    else:
+                        print(f"⚠️ Found non-S3 image in record-image: {src}")
+        
+        # Fallback: look for any record-image div (in case structure varies slightly)
+        record_image_div = soup.select_one(".record-image")
+        if record_image_div:
+            img_tag = record_image_div.select_one("img")
+            if img_tag and img_tag.get("src"):
+                src = img_tag.get("src")
+                if src.startswith("https://s3.amazonaws.com/static.militarytimes.com/thefallen/"):
+                    print(f"✅ Found S3 image in record-image (fallback): {src}")
+                    return src
+                else:
+                    print(f"⚠️ Found non-S3 image in record-image (fallback): {src}")
+        
+        # Final fallback: search all images for the specific S3 thefallen path
+        all_images = soup.find_all('img')
+        for img in all_images:
+            src = img.get('src', '')
+            if src.startswith("https://s3.amazonaws.com/static.militarytimes.com/thefallen/"):
+                print(f"✅ Found S3 thefallen image in document: {src}")
+                return src
+        
+        print("⚠️ No S3 thefallen image found on profile page")
+        return None
     
     def extract_name(self, soup):
         """Extract hero's name from profile page"""
@@ -527,61 +552,119 @@ class ImageDownloader:
     
     def download_hero_image(self, hero_data):
         """
-        Download hero's image with better error handling and rate limiting.
+        Download hero's image with S3 URL validation and placeholder fallback.
         """
         image_url = hero_data.get('image_url')
-        if not image_url:
-            print(f"⚠️ No image URL for {hero_data.get('name', 'Unknown')}")
-            return None
+        name = hero_data.get('name', 'unknown')
         
-        try:
-            # Create safe filename
-            name = hero_data.get('name', 'unknown').lower()
-            safe_name = re.sub(r'[^a-z0-9\s]', '', name)
-            safe_name = re.sub(r'\s+', '_', safe_name.strip())
-            filename = f"{safe_name}.jpg"
-            filepath = os.path.join(self.download_dir, filename)
+        # Create safe filename
+        safe_name = re.sub(r'[^a-z0-9\s]', '', name.lower())
+        safe_name = re.sub(r'\s+', '_', safe_name.strip())
+        filename = f"{safe_name}.jpg"
+        filepath = os.path.join(self.download_dir, filename)
+        
+        # Check if we have a valid S3 image URL
+        if image_url and image_url.startswith("https://s3.amazonaws.com/"):
+            print(f"📥 Downloading S3 image from: {image_url}")
             
-            print(f"📥 Downloading image from: {image_url}")
-            
-            # Add delay before downloading image to be respectful
-            time.sleep(3)
-            
-            # Download image with timeout and streaming
-            response = self.session.get(image_url, stream=True, timeout=30)
-            
-            if response.status_code == 200:
-                # Check if it's actually an image
-                content_type = response.headers.get('content-type', '')
-                if not content_type.startswith('image/'):
-                    print(f"⚠️ URL doesn't return an image: {content_type}")
-                    return None
+            try:
+                # Add delay before downloading image
+                time.sleep(3)
                 
-                with open(filepath, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                response = self.session.get(image_url, stream=True, timeout=30)
                 
-                # Verify the file was downloaded and has content
-                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                    # Optimize image for Facebook
-                    self.optimize_image(filepath)
-                    print(f"✅ Downloaded and optimized image: {filename}")
-                    return filename
+                if response.status_code == 200:
+                    # Check if it's actually an image
+                    content_type = response.headers.get('content-type', '')
+                    if content_type.startswith('image/'):
+                        with open(filepath, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        
+                        # Verify the file was downloaded and has content
+                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                            self.optimize_image(filepath)
+                            print(f"✅ Downloaded and optimized S3 image: {filename}")
+                            return filename
+                        else:
+                            print(f"❌ Downloaded S3 file is empty")
+                    else:
+                        print(f"⚠️ S3 URL doesn't return an image: {content_type}")
                 else:
-                    print(f"❌ Downloaded file is empty or doesn't exist")
-                    return None
-            else:
-                print(f"❌ Failed to download image: HTTP {response.status_code}")
-                return None
+                    print(f"❌ Failed to download S3 image: HTTP {response.status_code}")
+                    
+            except Exception as e:
+                print(f"❌ Error downloading S3 image: {str(e)}")
+        
+        # If no S3 image or download failed, create a placeholder
+        print(f"📷 No S3 image available for {name}. Creating placeholder...")
+        return self.create_placeholder_image(name, filepath)
+    
+    def create_placeholder_image(self, hero_name, filepath):
+        """
+        Create a placeholder image for heroes without photos.
+        """
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            
+            # Create a 1080x1080 image with military colors
+            img = Image.new('RGB', (1080, 1080), color='#1a472a')  # Military green
+            draw = ImageDraw.Draw(img)
+            
+            # Try to load a font, fall back to default if not available
+            try:
+                font_large = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 80)
+                font_medium = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 60)
+                font_small = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 40)
+            except:
+                font_large = ImageFont.load_default()
+                font_medium = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+            
+            # Draw text
+            text_color = '#ffffff'  # White text
+            
+            # Title
+            title = "IN MEMORY OF"
+            bbox = draw.textbbox((0, 0), title, font=font_medium)
+            title_width = bbox[2] - bbox[0]
+            draw.text(((1080 - title_width) // 2, 300), title, fill=text_color, font=font_medium)
+            
+            # Hero name (split into lines if too long)
+            name_words = hero_name.split()
+            if len(' '.join(name_words)) > 20:  # If name is too long
+                # Split into two lines
+                mid_point = len(name_words) // 2
+                line1 = ' '.join(name_words[:mid_point])
+                line2 = ' '.join(name_words[mid_point:])
                 
-        except requests.exceptions.Timeout:
-            print(f"❌ Timeout downloading image from {image_url}")
-            return None
-        except requests.exceptions.ConnectionError:
-            print(f"❌ Connection error downloading image from {image_url}")
-            return None
+                bbox1 = draw.textbbox((0, 0), line1, font=font_large)
+                line1_width = bbox1[2] - bbox1[0]
+                draw.text(((1080 - line1_width) // 2, 450), line1, fill=text_color, font=font_large)
+                
+                bbox2 = draw.textbbox((0, 0), line2, font=font_large)
+                line2_width = bbox2[2] - bbox2[0]
+                draw.text(((1080 - line2_width) // 2, 550), line2, fill=text_color, font=font_large)
+            else:
+                bbox = draw.textbbox((0, 0), hero_name, font=font_large)
+                name_width = bbox[2] - bbox[0]
+                draw.text(((1080 - name_width) // 2, 450), hero_name, fill=text_color, font=font_large)
+            
+            # Bottom text
+            bottom_text = "FALLEN HERO"
+            bbox = draw.textbbox((0, 0), bottom_text, font=font_medium)
+            bottom_width = bbox[2] - bbox[0]
+            draw.text(((1080 - bottom_width) // 2, 650), bottom_text, fill=text_color, font=font_medium)
+            
+            # Save the placeholder image
+            img.save(filepath, 'JPEG', quality=90)
+            
+            filename = os.path.basename(filepath)
+            print(f"✅ Created placeholder image: {filename}")
+            return filename
+            
         except Exception as e:
-            print(f"❌ Error downloading image: {str(e)}")
+            print(f"❌ Error creating placeholder image: {str(e)}")
             return None
     
     def optimize_image(self, filepath):

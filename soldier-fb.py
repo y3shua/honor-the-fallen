@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Honor the Fallen - Complete Facebook Posting Script
-Scrapes real fallen heroes data from Military Times and posts to Facebook as text posts with images
-"""
 
 import requests
 import json
@@ -21,110 +17,308 @@ class MilitaryTimesScraper:
         self.use_proxy = os.getenv('USE_PROXY', 'false').lower() == 'true'
         self.proxy = os.getenv('PROXY_URL') if self.use_proxy else None
         self.session = requests.Session()
+        
+        # Use a more recent Chrome user agent
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
         })
+        
+        # Configure session with connection pooling and timeouts
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=3,
+            pool_block=False
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
     
-    def get_heroes_for_date(self, target_date):
-        """
-        Search for fallen heroes who died on the given date using the proven search method.
-        Returns list of hero data dictionaries.
-        """
-        print(f"🔍 Searching for heroes who died on {target_date.strftime('%B %d, %Y')}")
-        
-        # Use the proven search function
-        fallen_list = self.get_fallen_service_members(target_date)
-        
-        if not fallen_list:
-            print(f"ℹ️ No fallen heroes found for {target_date.strftime('%B %d, %Y')}")
-            return []
-        
-        print(f"✅ Found {len(fallen_list)} fallen hero(s)")
-        
-        # Convert to our hero data format and scrape additional details
-        heroes = []
-        for fallen in fallen_list:
-            hero_data = self.convert_to_hero_data(fallen)
+    def test_connection(self):
+        """Test if we can connect to Military Times website"""
+        try:
+            print("🔗 Testing connection to Military Times...")
+            response = self.session.get(self.base_url, timeout=15)
             
-            # Scrape additional details from profile if available
-            if fallen.get('link'):
-                additional_data = self.scrape_hero_profile(fallen['link'])
-                if additional_data:
-                    hero_data.update(additional_data)
-            
-            heroes.append(hero_data)
-            time.sleep(1)  # Rate limiting
-        
-        return heroes
+            if response.status_code == 200:
+                print("✅ Successfully connected to Military Times")
+                return True
+            else:
+                print(f"⚠️ Connection test failed: HTTP {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Connection test failed: {str(e)}")
+            return False
     
-    def get_fallen_service_members(self, date):
-        """Query fallen service members for a specific date using the proven method"""
+    def get_single_hero_for_date(self, target_date):
+        """
+        Find a RANDOM fallen hero for the given date efficiently.
+        Only downloads the photo of the selected hero, not all heroes.
+        """
+        import random
+        
+        if not self.test_connection():
+            print("❌ Cannot connect to Military Times. Aborting.")
+            return None
+        
+        print(f"🔍 Searching for heroes who died on {target_date.strftime('%B %d')} (any year)")
+        
+        # Collect basic info (names, links) from ALL years first - NO image downloads yet
+        all_hero_refs = []  # Just references, not full data
+        current_year = datetime.now().year
+        
+        # Search all years from 2003 to current year
+        years = list(range(2003, current_year + 1))
+        random.shuffle(years)  # Randomize the order we search years
+        
+        for year in years:
+            year_date = target_date.replace(year=year)
+            print(f"📅 Checking {year_date.strftime('%B %d, %Y')}")
+            
+            try:
+                # Get basic hero info WITHOUT downloading images
+                fallen_list = self.get_fallen_service_members_basic(year_date)
+                
+                if fallen_list:
+                    # Add all hero references from this year to our collection
+                    for fallen in fallen_list:
+                        fallen['year'] = year  # Add year info
+                        all_hero_refs.append(fallen)
+                    print(f"  ✅ Found {len(fallen_list)} hero(s) for {year}")
+                
+            except Exception as e:
+                print(f"  ⚠️ Error searching year {year}: {str(e)}")
+                continue
+            
+            # Rate limit between year searches
+            time.sleep(1)
+        
+        if not all_hero_refs:
+            print("ℹ️ No fallen heroes found for this date across all years")
+            return None
+        
+        print(f"\n🎲 Found {len(all_hero_refs)} total heroes across all years. Selecting one randomly...")
+        
+        # Pick a completely random hero from all years
+        selected_fallen = random.choice(all_hero_refs)
+        selected_year = selected_fallen.get('year', 'Unknown')
+        
+        print(f"🎯 Randomly selected: {selected_fallen.get('name', 'Unknown')} from {selected_year}")
+        print(f"📸 Will download ONLY this hero's photo (not all heroes)")
+        
+        # Convert to our hero data format
+        hero_data = self.convert_to_hero_data(selected_fallen)
+        
+        # Scrape additional details if profile link is available
+        if selected_fallen.get('link'):
+            print(f"🔍 Getting additional details for {selected_fallen.get('name', 'Unknown')}")
+            time.sleep(2)  # Rate limit before profile scraping
+            additional_data = self.scrape_hero_profile(selected_fallen['link'])
+            if additional_data:
+                hero_data.update(additional_data)
+        
+        return hero_data
+    
+    def get_fallen_service_members_basic(self, date):
+        """
+        Get basic hero info (name, link, image URL) WITHOUT downloading images.
+        This is just for collecting references to pick from randomly.
+        """
         base_url = "https://thefallen.militarytimes.com/search"
         formatted_date = date.strftime("%m%%2F%d%%2F%Y")
         query_url = f"{base_url}?year=&year_month=&first_name=&last_name=&start_date={formatted_date}&end_date={formatted_date}&conflict=&home_state=&home_town="
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
         proxies = {"http": self.proxy, "https": self.proxy} if self.use_proxy and self.proxy else None
         
         try:
-            response = requests.get(query_url, headers=headers, proxies=proxies, timeout=30)
+            response = self.session.get(query_url, proxies=proxies, timeout=30)
+            
+            if response.status_code != 200:
+                print(f"❌ HTTP Error {response.status_code}")
+                return []
+                
+            if "Access Denied" in response.text or "Captcha" in response.text:
+                print(f"❌ Access blocked or CAPTCHA detected")
+                return []
+            
+            if "cloudflare" in response.text.lower() or "security check" in response.text.lower():
+                print(f"❌ Cloudflare or security check detected")
+                return []
+            
+        except requests.exceptions.ConnectionError as e:
+            print(f"❌ Connection error: {str(e)}")
+            return []
+        except requests.exceptions.Timeout as e:
+            print(f"❌ Request timeout: {str(e)}")
+            return []
         except requests.RequestException as e:
-            print(f"❌ Network error fetching {query_url}: {e}")
+            print(f"❌ Request error: {str(e)}")
             return []
             
-        if response.status_code != 200 or "Access Denied" in response.text or "Captcha" in response.text:
-            print(f"❌ Failed or blocked when fetching {query_url} (Status: {response.status_code})")
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            fallen_list = []
+            entries = soup.select(".data-box")
+            
+            for entry in entries:
+                try:
+                    name_tag = entry.select_one(".data-box-right h3 a")
+                    name = name_tag.text.strip() if name_tag else "Unknown"
+                    
+                    date_tag = entry.select_one(".data-box-right .blue-bold")
+                    date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
+                    
+                    profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
+                    if profile_link:
+                        profile_link = profile_link.rstrip(':').rstrip()
+                        if profile_link.startswith('/'):
+                            profile_link = f"https://thefallen.militarytimes.com{profile_link}"
+                    
+                    # Get image URL but DON'T download it yet
+                    image_tag = entry.select_one(".data-box-left img, .record-image img")
+                    image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
+                    
+                    if image_url:
+                        if image_url.startswith("https://s3.amazonaws.com/"):
+                            pass  # S3 URL is already absolute
+                        elif image_url.startswith("/"):
+                            image_url = f"https://thefallen.militarytimes.com{image_url}"
+                    
+                    # Check for higher quality S3 images
+                    record_image_div = entry.select_one(".record-image")
+                    if record_image_div and not image_url.startswith("https://s3.amazonaws.com/"):
+                        record_img = record_image_div.select_one("img")
+                        if record_img and record_img.get("src"):
+                            potential_s3_url = record_img["src"]
+                            if potential_s3_url.startswith("https://s3.amazonaws.com/"):
+                                image_url = potential_s3_url  # Prefer S3 URLs
+                    
+                    if name and name != "Unknown":
+                        fallen_list.append({
+                            "name": name,
+                            "date": date_of_death,
+                            "link": profile_link,
+                            "image_url": image_url
+                        })
+                    
+                except Exception as e:
+                    continue
+                    
+        except Exception as e:
+            print(f"❌ Error parsing HTML: {str(e)}")
             return []
             
-        soup = BeautifulSoup(response.text, "html.parser")
-        fallen_list = []
-        entries = soup.select(".data-box")
+        return fallen_list
+    
+    def get_fallen_service_members(self, date):
+        """Query fallen service members for a specific date using the proven method with better error handling"""
+        base_url = "https://thefallen.militarytimes.com/search"
+        formatted_date = date.strftime("%m%%2F%d%%2F%Y")
+        query_url = f"{base_url}?year=&year_month=&first_name=&last_name=&start_date={formatted_date}&end_date={formatted_date}&conflict=&home_state=&home_town="
         
-        for entry in entries:
-            name_tag = entry.select_one(".data-box-right h3 a")
-            name = name_tag.text.strip() if name_tag else "Unknown"
+        proxies = {"http": self.proxy, "https": self.proxy} if self.use_proxy and self.proxy else None
+        
+        try:
+            print(f"🌐 Requesting: {query_url}")
+            response = self.session.get(query_url, proxies=proxies, timeout=30)
             
-            date_tag = entry.select_one(".data-box-right .blue-bold")
-            date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
+            # Check response status and content
+            if response.status_code != 200:
+                print(f"❌ HTTP Error {response.status_code}")
+                return []
+                
+            if "Access Denied" in response.text or "Captcha" in response.text:
+                print(f"❌ Access blocked or CAPTCHA detected")
+                return []
             
-            profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
-            # Clean up profile link - remove any trailing colons or extra characters
-            if profile_link:
-                profile_link = profile_link.rstrip(':').rstrip()
-                # Make sure profile link is absolute
-                if profile_link.startswith('/'):
-                    profile_link = f"https://thefallen.militarytimes.com{profile_link}"
+            if "cloudflare" in response.text.lower() or "security check" in response.text.lower():
+                print(f"❌ Cloudflare or security check detected")
+                return []
             
-            image_tag = entry.select_one(".data-box-left img, .record-image img")
-            image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
+            print(f"✅ Successfully received response ({len(response.text)} chars)")
             
-            # Check for S3 bucket URLs or make sure image URL is absolute
-            if image_url:
-                if image_url.startswith("https://s3.amazonaws.com/"):
-                    # S3 URL is already absolute, use as-is
-                    pass
-                elif image_url.startswith("/"):
-                    image_url = f"https://thefallen.militarytimes.com{image_url}"
+        except requests.exceptions.ConnectionError as e:
+            print(f"❌ Connection error: {str(e)}")
+            return []
+        except requests.exceptions.Timeout as e:
+            print(f"❌ Request timeout: {str(e)}")
+            return []
+        except requests.RequestException as e:
+            print(f"❌ Request error: {str(e)}")
+            return []
             
-            # Also check for record-image div for higher quality S3 images
-            record_image_div = entry.select_one(".record-image")
-            if record_image_div and not image_url.startswith("https://s3.amazonaws.com/"):
-                record_img = record_image_div.select_one("img")
-                if record_img and record_img.get("src"):
-                    potential_s3_url = record_img["src"]
-                    if potential_s3_url.startswith("https://s3.amazonaws.com/"):
-                        image_url = potential_s3_url  # Prefer S3 URLs for better quality
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            fallen_list = []
+            entries = soup.select(".data-box")
             
-            fallen_list.append({
-                "name": name,
-                "date": date_of_death,
-                "link": profile_link,
-                "image_url": image_url
-            })
+            print(f"🔍 Found {len(entries)} potential entries")
             
-        print(f"✅ Found {len(fallen_list)} service members for {date.strftime('%B %d, %Y')}")
+            for i, entry in enumerate(entries):
+                try:
+                    name_tag = entry.select_one(".data-box-right h3 a")
+                    name = name_tag.text.strip() if name_tag else "Unknown"
+                    
+                    date_tag = entry.select_one(".data-box-right .blue-bold")
+                    date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
+                    
+                    profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
+                    # Clean up profile link - remove any trailing colons or extra characters
+                    if profile_link:
+                        profile_link = profile_link.rstrip(':').rstrip()
+                        # Make sure profile link is absolute
+                        if profile_link.startswith('/'):
+                            profile_link = f"https://thefallen.militarytimes.com{profile_link}"
+                    
+                    image_tag = entry.select_one(".data-box-left img, .record-image img")
+                    image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
+                    
+                    # Check for S3 bucket URLs or make sure image URL is absolute
+                    if image_url:
+                        if image_url.startswith("https://s3.amazonaws.com/"):
+                            # S3 URL is already absolute, use as-is
+                            pass
+                        elif image_url.startswith("/"):
+                            image_url = f"https://thefallen.militarytimes.com{image_url}"
+                    
+                    # Also check for record-image div for higher quality S3 images
+                    record_image_div = entry.select_one(".record-image")
+                    if record_image_div and not image_url.startswith("https://s3.amazonaws.com/"):
+                        record_img = record_image_div.select_one("img")
+                        if record_img and record_img.get("src"):
+                            potential_s3_url = record_img["src"]
+                            if potential_s3_url.startswith("https://s3.amazonaws.com/"):
+                                image_url = potential_s3_url  # Prefer S3 URLs for better quality
+                    
+                    if name and name != "Unknown":
+                        fallen_list.append({
+                            "name": name,
+                            "date": date_of_death,
+                            "link": profile_link,
+                            "image_url": image_url
+                        })
+                        print(f"  ✅ Entry {i+1}: {name}")
+                    
+                except Exception as e:
+                    print(f"  ⚠️ Error processing entry {i+1}: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            print(f"❌ Error parsing HTML: {str(e)}")
+            return []
+            
+        print(f"✅ Successfully parsed {len(fallen_list)} valid service members")
         return fallen_list
     
     def convert_to_hero_data(self, fallen):
@@ -316,10 +510,24 @@ class ImageDownloader:
     def __init__(self, download_dir="hero_images"):
         self.download_dir = download_dir
         os.makedirs(download_dir, exist_ok=True)
+        self.session = requests.Session()
+        
+        # Use same headers as scraper for consistency
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'image',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'cross-site'
+        })
     
     def download_hero_image(self, hero_data):
         """
-        Download hero's image and return the local filename.
+        Download hero's image with better error handling and rate limiting.
         """
         image_url = hero_data.get('image_url')
         if not image_url:
@@ -334,22 +542,44 @@ class ImageDownloader:
             filename = f"{safe_name}.jpg"
             filepath = os.path.join(self.download_dir, filename)
             
-            # Download image
-            response = requests.get(image_url, stream=True)
+            print(f"📥 Downloading image from: {image_url}")
+            
+            # Add delay before downloading image to be respectful
+            time.sleep(3)
+            
+            # Download image with timeout and streaming
+            response = self.session.get(image_url, stream=True, timeout=30)
+            
             if response.status_code == 200:
+                # Check if it's actually an image
+                content_type = response.headers.get('content-type', '')
+                if not content_type.startswith('image/'):
+                    print(f"⚠️ URL doesn't return an image: {content_type}")
+                    return None
+                
                 with open(filepath, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                 
-                # Optimize image for Facebook
-                self.optimize_image(filepath)
-                
-                print(f"✅ Downloaded image: {filename}")
-                return filename
+                # Verify the file was downloaded and has content
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    # Optimize image for Facebook
+                    self.optimize_image(filepath)
+                    print(f"✅ Downloaded and optimized image: {filename}")
+                    return filename
+                else:
+                    print(f"❌ Downloaded file is empty or doesn't exist")
+                    return None
             else:
-                print(f"❌ Failed to download image for {hero_data.get('name', 'Unknown')}")
+                print(f"❌ Failed to download image: HTTP {response.status_code}")
                 return None
                 
+        except requests.exceptions.Timeout:
+            print(f"❌ Timeout downloading image from {image_url}")
+            return None
+        except requests.exceptions.ConnectionError:
+            print(f"❌ Connection error downloading image from {image_url}")
+            return None
         except Exception as e:
             print(f"❌ Error downloading image: {str(e)}")
             return None
@@ -527,10 +757,7 @@ class FacebookPoster:
 
 def main():
     """
-    Main function that orchestrates the entire process:
-    1. Scrape fallen heroes data from Military Times for today's date
-    2. Download their images
-    3. Post memorials to Facebook as text posts with images
+    Main function - now optimized to find and post just ONE hero to avoid server overload
     """
     print("🇺🇸 Starting Fallen Heroes Memorial Script 🇺🇸")
     print(f"Search Mode: {os.getenv('SEARCH_MODE', 'daily')}")
@@ -539,7 +766,6 @@ def main():
     # Get configuration
     access_token = os.getenv('FB_ACCESS_TOKEN')
     page_id = os.getenv('FB_PAGE_ID')
-    search_mode = os.getenv('SEARCH_MODE', 'daily')
     
     if not access_token or not page_id:
         print("❌ Missing Facebook credentials")
@@ -550,76 +776,46 @@ def main():
     downloader = ImageDownloader()
     poster = FacebookPoster(access_token, page_id)
     
-    # Determine search date - always use today's month/day but search across years
+    # Use today's date
     today = datetime.now()
-    search_date = today
     
-    print(f"🔍 Searching for heroes who died on {search_date.strftime('%B %d')} (any year since 2003)")
+    print(f"🔍 Searching for ONE hero who died on {today.strftime('%B %d')} (any year since 2003)")
     
-    # Search for fallen heroes across all years for today's date
-    all_heroes = []
-    current_year = datetime.now().year
+    # Find just one hero to avoid overloading servers
+    hero = scraper.get_single_hero_for_date(today)
     
-    for year in range(2003, current_year + 1):
-        year_date = search_date.replace(year=year)
-        print(f"📅 Checking {year_date.strftime('%B %d, %Y')}")
-        
-        year_heroes = scraper.get_fallen_service_members(year_date)
-        
-        # Convert to our hero data format
-        for fallen in year_heroes:
-            hero_data = scraper.convert_to_hero_data(fallen)
-            
-            # Scrape additional details from profile if available
-            if fallen.get('link'):
-                print(f"🔍 Scraping profile for {fallen.get('name', 'Unknown')}")
-                additional_data = scraper.scrape_hero_profile(fallen['link'])
-                if additional_data:
-                    hero_data.update(additional_data)
-            
-            all_heroes.append(hero_data)
-        
-        time.sleep(1)  # Rate limiting between years
-    
-    if not all_heroes:
-        print(f"ℹ️ No fallen heroes found for {search_date.strftime('%B %d')} across all years")
+    if not hero:
+        print(f"ℹ️ No fallen heroes found for {today.strftime('%B %d')} across all years")
         return
     
-    print(f"✅ Found {len(all_heroes)} total fallen hero(s) for {search_date.strftime('%B %d')}")
+    print(f"✅ Selected hero: {hero.get('name', 'Unknown')}")
+    print(f"📅 Date of death: {hero.get('date_of_death', 'Unknown')}")
     
-    # Process each hero
-    successful_posts = 0
-    failed_posts = 0
+    # Download hero image
+    print(f"\n--- Processing: {hero.get('name', 'Unknown')} ---")
+    image_filename = downloader.download_hero_image(hero)
     
-    for i, hero in enumerate(all_heroes):
-        print(f"\n--- Processing {i+1}/{len(all_heroes)}: {hero.get('name', 'Unknown')} ---")
-        
-        # Download hero image
-        image_filename = downloader.download_hero_image(hero)
-        if not image_filename:
-            failed_posts += 1
-            continue
-        
-        image_path = os.path.join(downloader.download_dir, image_filename)
-        
-        # Post memorial to Facebook
-        success = poster.post_text_with_image(hero, image_path)
-        
-        if success:
-            successful_posts += 1
-        else:
-            failed_posts += 1
-        
-        # Rate limiting between posts
-        if i < len(all_heroes) - 1:
-            print("⏳ Waiting 3 seconds before next post...")
-            time.sleep(3)
+    if not image_filename:
+        print("❌ Failed to download hero image. Cannot create post.")
+        return
     
-    print(f"\n🎯 POSTING SUMMARY:")
-    print(f"✅ Successful posts: {successful_posts}")
-    print(f"❌ Failed posts: {failed_posts}")
-    print(f"📊 Total processed: {len(all_heroes)}")
-    print(f"📅 Search date: {search_date.strftime('%B %d')} (across all years 2003-{current_year})")
+    image_path = os.path.join(downloader.download_dir, image_filename)
+    
+    # Post memorial to Facebook
+    print(f"\n📝 Creating Facebook memorial post...")
+    success = poster.post_text_with_image(hero, image_path)
+    
+    if success:
+        print(f"\n🎯 SUCCESS!")
+        print(f"✅ Memorial post created for {hero.get('name', 'Unknown')}")
+        print(f"🇺🇸 Hero honored and remembered 🇺🇸")
+    else:
+        print(f"\n❌ Failed to create memorial post for {hero.get('name', 'Unknown')}")
+    
+    print(f"\n📊 SUMMARY:")
+    print(f"📅 Search date: {today.strftime('%B %d')}")
+    print(f"👤 Hero: {hero.get('name', 'Unknown')}")
+    print(f"📝 Post created: {'Yes' if success else 'No'}")
 
 if __name__ == "__main__":
     main()

@@ -33,4 +33,4 @@ jobs:
         echo "🇺🇸 Starting Fallen Heroes Memorial Script 🇺🇸"
         echo "Search Mode: $SEARCH_MODE"
         echo "Timestamp: $(date)"
-        python soldier-fb.py
+        python service-all-fb.py

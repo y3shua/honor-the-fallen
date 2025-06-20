@@ -1,0 +1,8 @@
+- name: Run Daily Heroes Multi-Post
+  env:
+    FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+    FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+    USE_PROXY: ${{ vars.USE_PROXY || 'false' }}
+  run: |
+    echo "🇺🇸 Creating comprehensive daily heroes post 🇺🇸"
+    python daily-heroes-multi-post.py

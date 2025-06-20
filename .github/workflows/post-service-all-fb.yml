@@ -5,4 +5,4 @@
     USE_PROXY: ${{ vars.USE_PROXY || 'false' }}
   run: |
     echo "🇺🇸 Creating comprehensive daily heroes post 🇺🇸"
-    python daily-heroes-multi-post.py
+    python service-all-fb.py

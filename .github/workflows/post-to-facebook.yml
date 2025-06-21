@@ -2,8 +2,8 @@ name: Daily Fallen Heroes Memorial
 
 on:
   # Run daily at 12:00 PM UTC (8:00 AM EST / 7:00 AM CST)
-  schedule:
-    - cron: '0 12 * * *'
+  #schedule:
+   # - cron: '0 12 * * *'
   
   # Allow manual triggering for testing
   workflow_dispatch:

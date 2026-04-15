@@ -52,7 +52,7 @@ def create_hero_id(person):
     """Create a unique ID for a hero based on name and date"""
     # Use name and date to create unique identifier
     hero_string = f"{person['name']}_{person['date']}"
-    return hashlib.sha256(hero_string.encode()).hexdigest()
+    return hashlib.md5(hero_string.encode()).hexdigest()
 
 def select_unposted_hero(service_members):
     """Select a random hero who hasn't been posted before"""

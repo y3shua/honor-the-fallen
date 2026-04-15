@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 import os
 import time
 import re
+import random
+from urllib.parse import urljoin, urlparse
 from PIL import Image, ImageDraw, ImageFont
 import io
 import json
@@ -81,14 +83,13 @@ def select_unposted_hero(service_members):
         unposted_heroes = service_members
     
     # Select random hero from unposted list
-    import random
     selected_hero = random.choice(unposted_heroes)
-    
+
     # Mark this hero as posted
     hero_id = create_hero_id(selected_hero)
     posted_heroes.add(hero_id)
     save_posted_heroes(posted_heroes)
-    
+
     print(f"[*] Selected unposted hero: {selected_hero['name']} - {selected_hero['date']}")
     return selected_hero
 
@@ -186,12 +187,17 @@ def get_detailed_service_member_info(profile_link):
     if not profile_link:
         return {}
     
-    # Clean the profile link - remove any trailing colons or whitespace
-    profile_link = profile_link.rstrip(':').rstrip().lstrip('/')
-    if not profile_link.startswith('/'):
-        profile_link = '/' + profile_link
-    
-    full_url = f"https://thefallen.militarytimes.com{profile_link}"
+    # Clean the profile link and construct a safe absolute URL
+    profile_link = profile_link.rstrip(':').rstrip()
+    base = "https://thefallen.militarytimes.com"
+    full_url = urljoin(base, profile_link)
+
+    # Reject URLs that escaped to a different host
+    parsed = urlparse(full_url)
+    if parsed.netloc != "thefallen.militarytimes.com" or parsed.scheme != "https":
+        print(f"[!] Rejected suspicious profile URL: {full_url}")
+        return {}
+
     print(f"    → Fetching: {full_url}")  # Debug URL
     
     headers = {
@@ -226,7 +232,6 @@ def get_detailed_service_member_info(profile_link):
                 print(f"    → Found death info: {h2_text}")
                 
                 # Extract date from h2 text
-                import re
                 date_match = re.search(r'Died ([^S]+) Serving', h2_text)
                 if date_match:
                     details["formatted_date"] = date_match.group(1).strip()
@@ -252,13 +257,15 @@ def get_detailed_service_member_info(profile_link):
                 content_after_hr = ""
                 if len(hr_tags) >= 1:
                     # Get all text between the <hr> tags or after the first one
+                    parts = []
                     current = hr_tags[0].next_sibling
                     while current and (len(hr_tags) < 2 or current != hr_tags[1]):
                         if hasattr(current, 'get_text'):
-                            content_after_hr += current.get_text()
+                            parts.append(current.get_text())
                         elif isinstance(current, str):
-                            content_after_hr += current
+                            parts.append(current)
                         current = current.next_sibling
+                    content_after_hr = ''.join(parts)
                 
                 if content_after_hr:
                     content_text = content_after_hr.strip()
@@ -440,86 +447,20 @@ def process_image_original_size(image_data):
         return image_data  # Return original if any processing fails
 
 def test_facebook_credentials():
-    """Load the list of previously posted heroes from file"""
-    posted_file = "posted_heroes.json"
-    if os.path.exists(posted_file):
-        try:
-            with open(posted_file, 'r') as f:
-                data = json.load(f)
-                return set(data.get('posted_heroes', []))
-        except Exception as e:
-            print(f"[!] Error loading posted heroes file: {e}")
-    return set()
-
-def save_posted_heroes(posted_heroes):
-    """Save the list of posted heroes to file"""
-    posted_file = "posted_heroes.json"
-    try:
-        data = {'posted_heroes': list(posted_heroes)}
-        with open(posted_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"[*] Saved {len(posted_heroes)} posted heroes to tracking file")
-    except Exception as e:
-        print(f"[!] Error saving posted heroes file: {e}")
-
-def create_hero_id(person):
-    """Create a unique ID for a hero based on name and date"""
-    # Use name and date to create unique identifier
-    hero_string = f"{person['name']}_{person['date']}"
-    return hashlib.md5(hero_string.encode()).hexdigest()
-
-def select_unposted_hero(service_members):
-    """Select a random hero who hasn't been posted before"""
-    if not service_members:
-        return None
-    
-    # Load previously posted heroes
-    posted_heroes = load_posted_heroes()
-    print(f"[*] Found {len(posted_heroes)} previously posted heroes")
-    
-    # Filter out already posted heroes
-    unposted_heroes = []
-    for hero in service_members:
-        hero_id = create_hero_id(hero)
-        if hero_id not in posted_heroes:
-            unposted_heroes.append(hero)
-        else:
-            print(f"[*] Skipping already posted hero: {hero['name']}")
-    
-    print(f"[*] Found {len(unposted_heroes)} unposted heroes out of {len(service_members)} total")
-    
-    if not unposted_heroes:
-        print("[!] All heroes for this date have been posted before!")
-        print("[*] Will reset tracking and start over with random selection...")
-        # Reset the tracking file and use all heroes
-        posted_heroes.clear()
-        save_posted_heroes(posted_heroes)
-        unposted_heroes = service_members
-    
-    # Select random hero from unposted list
-    import random
-    selected_hero = random.choice(unposted_heroes)
-    
-    # Mark this hero as posted
-    hero_id = create_hero_id(selected_hero)
-    posted_heroes.add(hero_id)
-    save_posted_heroes(posted_heroes)
-    
-    print(f"[*] Selected unposted hero: {selected_hero['name']} - {selected_hero['date']}")
-    return selected_hero
     """Test if Facebook credentials are valid"""
     print("[*] Testing Facebook credentials...")
-    
+
     if not ACCESS_TOKEN or not PAGE_ID:
         print("❌ Missing ACCESS_TOKEN or PAGE_ID")
         return False
-    
-    # Test basic API access
-    test_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}?access_token={ACCESS_TOKEN}"
-    
+
+    test_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}"
     try:
-        response = requests.get(test_url, timeout=30)
-        
+        response = requests.get(
+            test_url,
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            timeout=30
+        )
         if response.status_code == 200:
             page_info = response.json()
             print(f"✅ Successfully connected to page: {page_info.get('name', 'Unknown')}")
@@ -878,7 +819,7 @@ def main():
         
     else:
         # Default: search today across multiple years
-        search_years = [2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+        search_years = list(range(2003, datetime.now().year + 1))
         print(f"\n[*] 🔍 DAILY SEARCH: Searching for fallen service members on {today.strftime('%B %d')} across multiple years...")
         
         for year in search_years:
@@ -907,34 +848,6 @@ def main():
                 print(f"    Skipping {year} (date doesn't exist)")
                 continue
         
-        # Special handling for June 16, 2025 - also search some additional years for more options
-        if today.month == 6 and today.day == 16:
-            print(f"\n[*] 🔍 SPECIAL: Additional search for June 16 across extended years...")
-            extended_years = [2001, 2002, 2026, 2027]  # Add some extra years for more options
-            for year in extended_years:
-                try:
-                    search_date = datetime(year, 6, 16)
-                    print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')} (extended search)...")
-                    
-                    fallen = get_fallen_service_members(search_date)
-                    
-                    if fallen:
-                        print(f"    Found {len(fallen)} service members")
-                        for person in fallen:
-                            if person["image_url"]:
-                                all_service_members.append(person)
-                                print(f"    ✅ {person['name']} - {person['date']} (has photo)")
-                            else:
-                                print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
-                    else:
-                        print(f"    No service members found")
-                        
-                    time.sleep(1)  # Rate limiting
-                    
-                except Exception as e:
-                    print(f"    Error searching {year}: {e}")
-                    continue
-
     print(f"\n" + "=" * 60)
     
     if all_service_members:

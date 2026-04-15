@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Downloaded images (runtime artifacts)
+hero_images/
+daily_heroes_images/
+
+# Tracking file (runtime state)
+posted_heroes.json
+
+# Logs
+*.log
+error_*.txt

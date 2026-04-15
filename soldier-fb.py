@@ -4,8 +4,9 @@ import requests
 import json
 import time
 import os
+import random
 from datetime import datetime, timedelta
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 from bs4 import BeautifulSoup
 import re
@@ -43,6 +44,34 @@ class MilitaryTimesScraper:
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
+
+        # Precompile regex patterns used during extraction (avoids recompiling on every call)
+        self._rank_re = re.compile(
+            r'(Private First Class|Staff Sergeant|Sergeant First Class|Master Sergeant|'
+            r'First Sergeant|Sergeant Major|Second Lieutenant|First Lieutenant|Captain|'
+            r'Major|Lieutenant Colonel|Colonel|Brigadier General|Major General|'
+            r'Lieutenant General|General|Corporal|Sergeant|Private|'
+            r'Seaman|Petty Officer|Chief Petty Officer|Warrant Officer|Ensign|'
+            r'Lieutenant Commander|Commander|Admiral|Airman|Senior Airman|'
+            r'Technical Sergeant|Senior Master Sergeant|Chief Master Sergeant)',
+            re.IGNORECASE
+        )
+        self._age_re = re.compile(r'age (\d+)', re.IGNORECASE)
+        self._hometown_res = [
+            re.compile(r'of ([^,]+, [A-Z]{2})', re.IGNORECASE),
+            re.compile(r'from ([^,]+, [A-Z]{2})', re.IGNORECASE),
+            re.compile(r'hometown[:\s]+([^,\n]+)', re.IGNORECASE),
+        ]
+        self._unit_res = [
+            re.compile(r'(\d+(?:st|nd|rd|th)?\s+[^,\n]+(?:Division|Regiment|Battalion|Company|Squadron))', re.IGNORECASE),
+            re.compile(r'(Special Operations [^,\n]+)', re.IGNORECASE),
+            re.compile(r'(Rangers?[^,\n]*)', re.IGNORECASE),
+        ]
+        self._circumstance_res = [
+            re.compile(r'(killed in action[^.]*\.)', re.IGNORECASE),
+            re.compile(r'(died from[^.]*\.)', re.IGNORECASE),
+            re.compile(r'(was killed when[^.]*\.)', re.IGNORECASE),
+        ]
     
     def test_connection(self):
         """Test if we can connect to Military Times website"""
@@ -66,8 +95,6 @@ class MilitaryTimesScraper:
         Find a RANDOM fallen hero for the given date efficiently.
         Only downloads the photo of the selected hero, not all heroes.
         """
-        import random
-        
         if not self.test_connection():
             print("❌ Cannot connect to Military Times. Aborting.")
             return None
@@ -331,17 +358,18 @@ class MilitaryTimesScraper:
                 return None
             
             soup = BeautifulSoup(response.content, 'html.parser')
-            
+            text = soup.get_text()  # Extract once, reused by all extract_* methods
+
             # Extract hero information
             hero_data = {
-                'rank': self.extract_rank(soup),
-                'age': self.extract_age(soup),
-                'hometown': self.extract_hometown(soup),
-                'branch': self.extract_branch(soup),
-                'unit': self.extract_unit(soup),
-                'location': self.extract_location(soup),
-                'circumstances': self.extract_circumstances(soup),
-                'image_url': self.extract_s3_image_url(soup)  # Only look for S3 images
+                'rank': self.extract_rank(text),
+                'age': self.extract_age(text),
+                'hometown': self.extract_hometown(text),
+                'branch': self.extract_branch(text),
+                'unit': self.extract_unit(text),
+                'location': self.extract_location(text),
+                'circumstances': self.extract_circumstances(text),
+                'image_url': self.extract_s3_image_url(soup)  # soup needed for CSS selectors
             }
             
             return hero_data
@@ -406,112 +434,67 @@ class MilitaryTimesScraper:
                 return re.sub(r'\s+', ' ', text)
         return "Unknown Hero"
     
-    def extract_rank(self, soup):
+    def extract_rank(self, text):
         """Extract military rank"""
-        # Look for rank patterns
-        text = soup.get_text()
-        rank_patterns = [
-            r'(Private First Class|Staff Sergeant|Sergeant First Class|Master Sergeant|'
-            r'First Sergeant|Sergeant Major|Second Lieutenant|First Lieutenant|Captain|'
-            r'Major|Lieutenant Colonel|Colonel|Brigadier General|Major General|'
-            r'Lieutenant General|General|Corporal|Sergeant|Private|'
-            r'Seaman|Petty Officer|Chief Petty Officer|Warrant Officer|Ensign|'
-            r'Lieutenant Commander|Commander|Admiral|Airman|Senior Airman|'
-            r'Technical Sergeant|Master Sergeant|Senior Master Sergeant|Chief Master Sergeant)'
-        ]
-        
-        for pattern in rank_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return ""
-    
-    def extract_age(self, soup):
+        match = self._rank_re.search(text)
+        return match.group(1) if match else ""
+
+    def extract_age(self, text):
         """Extract age at time of death"""
-        text = soup.get_text()
-        age_match = re.search(r'age (\d+)', text, re.IGNORECASE)
-        if age_match:
-            return age_match.group(1)
-        return ""
-    
-    def extract_hometown(self, soup):
+        match = self._age_re.search(text)
+        return match.group(1) if match else ""
+
+    def extract_hometown(self, text):
         """Extract hometown information"""
-        # Look for hometown patterns
-        text = soup.get_text()
-        hometown_patterns = [
-            r'of ([^,]+, [A-Z]{2})',
-            r'from ([^,]+, [A-Z]{2})',
-            r'hometown[:\s]+([^,\n]+)'
-        ]
-        
-        for pattern in hometown_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+        for pattern in self._hometown_res:
+            match = pattern.search(text)
             if match:
                 return match.group(1).strip()
         return ""
-    
-    def extract_branch(self, soup):
+
+    def extract_branch(self, text):
         """Extract military branch"""
-        text = soup.get_text()
         branches = ['Army', 'Navy', 'Air Force', 'Marines', 'Coast Guard']
+        text_lower = text.lower()
         for branch in branches:
-            if branch.lower() in text.lower():
+            if branch.lower() in text_lower:
                 return f"U.S. {branch}"
         return ""
-    
-    def extract_unit(self, soup):
+
+    def extract_unit(self, text):
         """Extract military unit information"""
-        text = soup.get_text()
-        # Look for unit patterns
-        unit_patterns = [
-            r'(\d+(?:st|nd|rd|th)?\s+[^,\n]+(?:Division|Regiment|Battalion|Company|Squadron))',
-            r'(Special Operations [^,\n]+)',
-            r'(Rangers?[^,\n]*)'
-        ]
-        
-        for pattern in unit_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+        for pattern in self._unit_res:
+            match = pattern.search(text)
             if match:
                 return match.group(1).strip()
         return ""
-    
-    def extract_date_of_death(self, soup):
+
+    def extract_date_of_death(self, text):
         """Extract date of death"""
-        text = soup.get_text()
-        # Look for date patterns
         date_patterns = [
             r'died[:\s]+([A-Z][a-z]+ \d{1,2}, \d{4})',
             r'killed[:\s]+([A-Z][a-z]+ \d{1,2}, \d{4})',
             r'(\d{1,2}/\d{1,2}/\d{4})'
         ]
-        
         for pattern in date_patterns:
             match = re.search(pattern, text)
             if match:
                 return match.group(1)
         return ""
-    
-    def extract_location(self, soup):
+
+    def extract_location(self, text):
         """Extract location of death"""
-        text = soup.get_text()
         locations = ['Afghanistan', 'Iraq', 'Syria', 'Kuwait', 'Qatar']
+        text_lower = text.lower()
         for location in locations:
-            if location.lower() in text.lower():
+            if location.lower() in text_lower:
                 return location
         return ""
-    
-    def extract_circumstances(self, soup):
+
+    def extract_circumstances(self, text):
         """Extract circumstances of death"""
-        text = soup.get_text()
-        # Look for circumstance patterns
-        circumstance_patterns = [
-            r'(killed in action[^.]*\.)',
-            r'(died from[^.]*\.)',
-            r'(was killed when[^.]*\.)'
-        ]
-        
-        for pattern in circumstance_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+        for pattern in self._circumstance_res:
+            match = pattern.search(text)
             if match:
                 return match.group(1).strip()
         return ""
@@ -549,7 +532,10 @@ class ImageDownloader:
             'Sec-Fetch-Mode': 'no-cors',
             'Sec-Fetch-Site': 'cross-site'
         })
-    
+        adapter = requests.adapters.HTTPAdapter(max_retries=3)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+
     def download_hero_image(self, hero_data):
         """
         Download hero's image with S3 URL validation and placeholder fallback.
@@ -605,8 +591,6 @@ class ImageDownloader:
         Create a placeholder image for heroes without photos.
         """
         try:
-            from PIL import Image, ImageDraw, ImageFont
-            
             # Create a 1080x1080 image with military colors
             img = Image.new('RGB', (1080, 1080), color='#1a472a')  # Military green
             draw = ImageDraw.Draw(img)
@@ -699,13 +683,11 @@ class FacebookPoster:
         try:
             with open(image_path, 'rb') as image_file:
                 files = {'source': image_file}
-                data = {
-                    'access_token': self.access_token,
-                    'published': 'false'
-                }
-                
-                response = requests.post(url, files=files, data=data)
-                
+                data = {'published': 'false'}
+                headers = {"Authorization": f"Bearer {self.access_token}"}
+
+                response = requests.post(url, files=files, data=data, headers=headers)
+
                 if response.status_code == 200:
                     result = response.json()
                     photo_id = result.get('id')
@@ -816,14 +798,14 @@ class FacebookPoster:
         memorial_text = self.create_memorial_text(hero_data)
         
         data = {
-            'access_token': self.access_token,
             'message': memorial_text,
             'attached_media[0]': json.dumps({'media_fbid': photo_id}),
             'published': 'true'
         }
-        
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
         try:
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, headers=headers)
             
             if response.status_code == 200:
                 result = response.json()

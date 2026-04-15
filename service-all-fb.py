@@ -471,12 +471,12 @@ class FacebookMultiPoster:
             with open(image_path, 'rb') as image_file:
                 files = {'source': image_file}
                 data = {
+                    'access_token': self.access_token,
                     'caption': caption,
                     'published': 'false'
                 }
-                headers = {"Authorization": f"Bearer {self.access_token}"}
 
-                response = requests.post(url, files=files, data=data, headers=headers)
+                response = requests.post(url, files=files, data=data)
                 
                 if response.status_code == 200:
                     result = response.json()
@@ -592,14 +592,14 @@ class FacebookMultiPoster:
             attached_media[f'attached_media[{i}]'] = json.dumps({'media_fbid': photo_id})
         
         data = {
+            'access_token': self.access_token,
             'message': post_text,
             'published': 'true',
             **attached_media
         }
-        headers = {"Authorization": f"Bearer {self.access_token}"}
 
         try:
-            response = requests.post(url, data=data, headers=headers)
+            response = requests.post(url, data=data)
             
             if response.status_code == 200:
                 result = response.json()

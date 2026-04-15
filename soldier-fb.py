@@ -683,10 +683,12 @@ class FacebookPoster:
         try:
             with open(image_path, 'rb') as image_file:
                 files = {'source': image_file}
-                data = {'published': 'false'}
-                headers = {"Authorization": f"Bearer {self.access_token}"}
+                data = {
+                    'access_token': self.access_token,
+                    'published': 'false'
+                }
 
-                response = requests.post(url, files=files, data=data, headers=headers)
+                response = requests.post(url, files=files, data=data)
 
                 if response.status_code == 200:
                     result = response.json()
@@ -798,14 +800,14 @@ class FacebookPoster:
         memorial_text = self.create_memorial_text(hero_data)
         
         data = {
+            'access_token': self.access_token,
             'message': memorial_text,
             'attached_media[0]': json.dumps({'media_fbid': photo_id}),
             'published': 'true'
         }
-        headers = {"Authorization": f"Bearer {self.access_token}"}
 
         try:
-            response = requests.post(url, data=data, headers=headers)
+            response = requests.post(url, data=data)
             
             if response.status_code == 200:
                 result = response.json()

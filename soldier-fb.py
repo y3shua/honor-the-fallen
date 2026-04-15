@@ -675,7 +675,34 @@ class FacebookPoster:
         self.access_token = access_token
         self.page_id = page_id
         self.base_url = "https://graph.facebook.com/v18.0"
-        
+        self._ensure_page_token()
+
+    def _ensure_page_token(self):
+        """Exchange a User Access Token for a Page Access Token if needed.
+
+        Publishing to a page (including unpublished photo uploads) requires a
+        Page Access Token.  User Access Tokens will be silently exchanged here;
+        an already-valid Page Access Token is returned as-is by the API.
+        """
+        url = f"{self.base_url}/{self.page_id}"
+        try:
+            resp = requests.get(
+                url,
+                params={'fields': 'access_token', 'access_token': self.access_token},
+                timeout=15
+            )
+            if resp.status_code == 200:
+                page_token = resp.json().get('access_token')
+                if page_token:
+                    self.access_token = page_token
+                    print("✅ Page Access Token obtained successfully")
+                else:
+                    print("⚠️  Token exchange returned no page token; using original token")
+            else:
+                print(f"⚠️  Token exchange failed ({resp.status_code}); using original token")
+        except Exception as e:
+            print(f"⚠️  Token exchange error: {e}; using original token")
+
     def upload_image_unpublished(self, image_path):
         """Upload image to Facebook without publishing it."""
         url = f"{self.base_url}/{self.page_id}/photos"

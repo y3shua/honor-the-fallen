@@ -96,7 +96,7 @@ class MilitaryTimesScraper:
             (re.compile(r'\bArmy\b', re.IGNORECASE), 'U.S. Army'),
             (re.compile(r'\bNavy\b', re.IGNORECASE), 'U.S. Navy'),
             (re.compile(r'\bAir Force\b', re.IGNORECASE), 'U.S. Air Force'),
-            (re.compile(r'\bMarine\b', re.IGNORECASE), 'U.S. Marines'),
+            (re.compile(r'\bMarines?\b', re.IGNORECASE), 'U.S. Marines'),
             (re.compile(r'\bCoast Guard\b', re.IGNORECASE), 'U.S. Coast Guard'),
         ]
         self._age_re = re.compile(r'age (\d+)', re.IGNORECASE)

@@ -39,17 +39,60 @@ class MilitaryTimesScraper:
             'Cache-Control': 'max-age=0'
         })
 
-        # Precompile regex patterns used during extraction (avoids recompiling on every call)
+        # Precompile regex patterns used during extraction (avoids recompiling on every call).
+        # Multi-word / more-specific ranks listed first so they match before their substrings.
+        # Word boundaries prevent false positives from narrative text (e.g. "Commanding Officer").
         self._rank_re = re.compile(
-            r'(Private First Class|Staff Sergeant|Sergeant First Class|Master Sergeant|'
-            r'First Sergeant|Sergeant Major|Second Lieutenant|First Lieutenant|Captain|'
-            r'Major|Lieutenant Colonel|Colonel|Brigadier General|Major General|'
-            r'Lieutenant General|General|Corporal|Sergeant|Private|'
-            r'Seaman|Petty Officer|Chief Petty Officer|Warrant Officer|Ensign|'
-            r'Lieutenant Commander|Commander|Admiral|Airman|Senior Airman|'
-            r'Technical Sergeant|Senior Master Sergeant|Chief Master Sergeant)',
+            r'\b('
+            r'Sergeant Major of the Marine Corps'
+            r'|Master Gunnery Sergeant'
+            r'|Chief Master Sergeant'
+            r'|Senior Master Sergeant'
+            r'|Sergeant First Class'
+            r'|Private First Class'
+            r'|Lance Corporal'
+            r'|Staff Sergeant'
+            r'|First Sergeant'
+            r'|Gunnery Sergeant'
+            r'|Master Sergeant'
+            r'|Sergeant Major'
+            r'|Lieutenant General'
+            r'|Major General'
+            r'|Brigadier General'
+            r'|Lieutenant Colonel'
+            r'|Lieutenant Commander'
+            r'|Second Lieutenant'
+            r'|First Lieutenant'
+            r'|Technical Sergeant'
+            r'|Senior Airman'
+            r'|Chief Petty Officer'
+            r'|Petty Officer'
+            r'|Chief Warrant Officer'
+            r'|Warrant Officer'
+            r'|Specialist'
+            r'|Corporal'
+            r'|Sergeant'
+            r'|Private'
+            r'|Captain'
+            r'|Commander'
+            r'|Admiral'
+            r'|Colonel'
+            r'|General'
+            r'|Major'
+            r'|Ensign'
+            r'|Seaman'
+            r'|Airman'
+            r')\b',
             re.IGNORECASE
         )
+        # Branch patterns use word boundaries so "Marine" matches "Marine Corps" and "Marines"
+        self._branch_res = [
+            (re.compile(r'\bArmy\b', re.IGNORECASE), 'U.S. Army'),
+            (re.compile(r'\bNavy\b', re.IGNORECASE), 'U.S. Navy'),
+            (re.compile(r'\bAir Force\b', re.IGNORECASE), 'U.S. Air Force'),
+            (re.compile(r'\bMarine\b', re.IGNORECASE), 'U.S. Marines'),
+            (re.compile(r'\bCoast Guard\b', re.IGNORECASE), 'U.S. Coast Guard'),
+        ]
         self._age_re = re.compile(r'age (\d+)', re.IGNORECASE)
         self._hometown_res = [
             re.compile(r'of ([^,]+, [A-Z]{2})', re.IGNORECASE),
@@ -122,10 +165,18 @@ class MilitaryTimesScraper:
         
         try:
             response = self.session.get(query_url, proxies=proxies, timeout=30)
-            
+
             if response.status_code != 200:
                 return []
-            
+
+            if "Access Denied" in response.text or "Captcha" in response.text:
+                print("❌ Access blocked or CAPTCHA detected")
+                return []
+
+            if "cloudflare" in response.text.lower() or "security check" in response.text.lower():
+                print("❌ Cloudflare or security check detected")
+                return []
+
             soup = BeautifulSoup(response.text, "html.parser")
             fallen_list = []
             entries = soup.select(".data-box")
@@ -245,11 +296,9 @@ class MilitaryTimesScraper:
 
     def extract_branch(self, text):
         """Extract military branch"""
-        branches = ['Army', 'Navy', 'Air Force', 'Marines', 'Coast Guard']
-        text_lower = text.lower()
-        for branch in branches:
-            if branch.lower() in text_lower:
-                return f"U.S. {branch}"
+        for pattern, name in self._branch_res:
+            if pattern.search(text):
+                return name
         return ""
 
     def extract_unit(self, text):
@@ -311,20 +360,14 @@ class ImageProcessor:
             success = self.download_or_create_image(hero, filepath)
             
             if success:
-                # Create caption for this image (rank + name)
-                rank = hero.get('rank', '').strip()
-                name = hero.get('name', 'Unknown').strip()
-                caption = f"{rank} {name}".strip() if rank else name
-                
+                # Use the name as-is — MilitaryTimes names already include rank/branch prefix
+                caption = hero.get('name', 'Unknown').strip()
                 image_data.append({
                     'filepath': filepath,
                     'caption': caption,
                     'hero': hero
                 })
-            
-            # Rate limit between image processing
-            time.sleep(2)
-        
+
         return image_data
     
     def download_or_create_image(self, hero_data, filepath):
@@ -334,6 +377,7 @@ class ImageProcessor:
         # Try to download S3 image first
         if image_url and image_url.startswith("https://s3.amazonaws.com/static.militarytimes.com/thefallen/"):
             try:
+                time.sleep(1)  # Rate limit before network download only
                 print(f"📥 Downloading S3 image...")
                 response = self.session.get(image_url, stream=True, timeout=30)
                 
@@ -379,12 +423,8 @@ class ImageProcessor:
             title_width = bbox[2] - bbox[0]
             draw.text(((1080 - title_width) // 2, 350), title, fill=text_color, font=font_medium)
             
-            # Hero name
-            hero_name = hero_data.get('name', 'Unknown Hero')
-            rank = hero_data.get('rank', '').strip()
-            
-            # Combine rank and name
-            full_name = f"{rank} {hero_name}".strip() if rank else hero_name
+            # Name from MilitaryTimes already includes rank/branch prefix
+            full_name = hero_data.get('name', 'Unknown Hero').strip()
             
             # Handle long names
             if len(full_name) > 25:
@@ -519,94 +559,76 @@ class FacebookMultiPoster:
             return None
     
     def create_comprehensive_post_text(self, heroes, date):
-        """Create comprehensive text for the multi-hero post"""
+        """Create post text listing all fallen heroes for the date."""
         lines = []
-        
-        # Header
+        n = len(heroes)
+
         lines.append("🇺🇸 HONORING OUR FALLEN HEROES 🇺🇸")
         lines.append("")
-        lines.append(f"📅 On this day, {date.strftime('%B %d')}, we remember these brave service members who made the ultimate sacrifice:")
+        lines.append(
+            f"On this day, {date.strftime('%B %d')}, we remember "
+            f"{n} {'service member' if n == 1 else 'service members'} "
+            f"who paid the ultimate price for our freedom:"
+        )
         lines.append("")
-        
-        # List each hero with details
-        for i, hero in enumerate(heroes, 1):
-            name = hero.get('name', 'Unknown Hero')
-            rank = hero.get('rank', '').strip()
-            date_of_death = hero.get('date_of_death', '').strip()
-            location = hero.get('location', '').strip()
-            year = hero.get('year', '')
-            
-            # Format hero entry
-            hero_line = f"{i}. "
-            if rank:
-                hero_line += f"{rank} {name}"
-            else:
-                hero_line += name
-            
-            lines.append(hero_line)
-            
-            # Add death details if available
-            details = []
-            if date_of_death and date_of_death != 'Unknown Date':
-                details.append(f"Died: {date_of_death}")
-            elif year:
-                details.append(f"Died: {year}")
-            
-            if location:
-                details.append(f"Location: {location}")
-            
-            if details:
-                lines.append(f"   {' | '.join(details)}")
-            
+
+        for hero in heroes:
+            # Name from MilitaryTimes already includes rank/branch prefix
+            # (e.g. "Marine Staff Sgt. Jimmy J. Arroyave") — use it as-is
+            name = hero.get('name', 'Unknown Hero').strip()
+            lines.append(name)
+
+            detail_parts = []
+            if hero.get('branch'):
+                detail_parts.append(hero['branch'])
+            date_str = hero.get('date_of_death', '').strip()
+            if not date_str or date_str == 'Unknown Date':
+                year = hero.get('year', '')
+                if year:
+                    date_str = str(year)
+            if date_str:
+                detail_parts.append(date_str)
+            if hero.get('location'):
+                detail_parts.append(hero['location'])
+            if detail_parts:
+                lines.append("  " + "  |  ".join(detail_parts))
+
             lines.append("")
-        
-        # Memorial message
-        lines.append("🌟 Each of these heroes answered the call to serve our nation with courage and dedication. Their sacrifice will never be forgotten, and their memory will live on in the hearts of all Americans.")
+
+        lines.append("They answered the call when our nation needed them most. We owe them a debt that can never be repaid. Please share and help keep their memory alive.")
         lines.append("")
-        lines.append("💙 We honor their service and extend our deepest gratitude to their families, friends, and fellow service members who continue to carry their legacy forward.")
-        lines.append("")
-        lines.append("🙏 Please take a moment to read their names, honor their memory, and share their stories. They gave everything for our freedom.")
-        lines.append("")
-        
-        # Hashtags
-        hashtags = [
-            "#FallenHeroes", "#NeverForget", "#HonorTheFallen", 
-            "#MemorialDay", "#Military", "#Sacrifice", 
-            "#Freedom", "#Heroes", "#RememberThem", 
-            "#Service", "#Gratitude", "#UltimatePrice"
-        ]
-        
-        # Add branch-specific hashtags
+
+        hashtags = ["#FallenHeroes", "#NeverForget", "#HonorTheFallen", "#Military", "#Sacrifice", "#RememberThem"]
         branches_found = set()
         for hero in heroes:
             branch = hero.get('branch', '').lower()
             if 'army' in branch:
-                branches_found.add('Army')
+                branches_found.add('army')
             elif 'navy' in branch:
-                branches_found.add('Navy')
+                branches_found.add('navy')
             elif 'air force' in branch:
-                branches_found.add('AirForce')
+                branches_found.add('airforce')
             elif 'marine' in branch:
-                branches_found.add('Marines')
+                branches_found.add('marines')
             elif 'coast guard' in branch:
-                branches_found.add('CoastGuard')
-        
-        for branch in branches_found:
-            if branch == 'Army':
+                branches_found.add('coastguard')
+
+        for b in sorted(branches_found):
+            if b == 'army':
                 hashtags.extend(['#Army', '#USArmy'])
-            elif branch == 'Navy':
+            elif b == 'navy':
                 hashtags.extend(['#Navy', '#USNavy'])
-            elif branch == 'AirForce':
+            elif b == 'airforce':
                 hashtags.extend(['#AirForce', '#USAF'])
-            elif branch == 'Marines':
+            elif b == 'marines':
                 hashtags.extend(['#Marines', '#USMC', '#SemperFi'])
-            elif branch == 'CoastGuard':
+            elif b == 'coastguard':
                 hashtags.extend(['#CoastGuard', '#USCG'])
-        
+
         lines.append(" ".join(hashtags))
         lines.append("")
-        lines.append("🇺🇸 \"All gave some, some gave all\" 🇺🇸")
-        
+        lines.append('🇺🇸 "All gave some, some gave all" 🇺🇸')
+
         return "\n".join(lines)
     
     def create_post_with_multiple_images(self, post_text, photo_ids):

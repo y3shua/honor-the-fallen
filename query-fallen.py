@@ -1,877 +1,502 @@
 #!/usr/bin/env python3
 """
-Fallen Heroes Memorial Script
-Queries fallen service members from militarytimes.com and posts detailed memorials to Facebook
-Enhanced with album posting - creates single post with multiple photos
+Honor the Fallen daily memorial post.
+
+Finds every service member in the Military Times "Honor the Fallen" database
+who died on today's month/day in any year, scrapes each profile, builds a
+uniform image for each (real photo or rank/name placeholder), and publishes
+ONE Facebook Page post with every image attached.
+
+Env:
+  FB_ACCESS_TOKEN   Page access token (pages_manage_posts, pages_read_engagement)
+  FB_PAGE_ID        Numeric Page ID
+  GRAPH_VERSION     Graph API version (default v23.0)
+  TARGET_DATE       Optional MM-DD override (default: today)
+  START_YEAR        First year to search (default 2001)
+  DRY_RUN           "true" writes preview/ files instead of posting
+  USE_PROXY, PROXY_URL  Optional proxy for militarytimes.com requests
 """
+import io
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import os
-import time
-import re
-import random
-from urllib.parse import urljoin, urlparse
-from PIL import Image, ImageDraw, ImageFont
-import io
-import json
-import hashlib
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Environment variables
-ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
-PAGE_ID = os.getenv("FB_PAGE_ID")
-USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
-PROXY = os.getenv("PROXY_URL")
-SEARCH_MODE = os.getenv("SEARCH_MODE", "daily")  # daily, comprehensive, or date_range
+BASE = "https://thefallen.militarytimes.com"
+SEARCH_URL = f"{BASE}/search"
+CANVAS = (1080, 1080)
+LANCZOS = Image.Resampling.LANCZOS
+DELAY = 1.0
 
-def load_posted_heroes():
-    """Load the list of previously posted heroes from file"""
-    posted_file = "posted_heroes.json"
-    if os.path.exists(posted_file):
-        try:
-            with open(posted_file, 'r') as f:
-                data = json.load(f)
-                return set(data.get('posted_heroes', []))
-        except Exception as e:
-            print(f"[!] Error loading posted heroes file: {e}")
-    return set()
+TOKEN = os.getenv("FB_ACCESS_TOKEN", "").strip()
+PAGE_ID = os.getenv("FB_PAGE_ID", "").strip()
+GRAPH = f"https://graph.facebook.com/{os.getenv('GRAPH_VERSION', 'v23.0')}"
+START_YEAR = int(os.getenv("START_YEAR", "2001"))
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+PROXY = os.getenv("PROXY_URL") if os.getenv("USE_PROXY", "false").lower() == "true" else None
 
-def save_posted_heroes(posted_heroes):
-    """Save the list of posted heroes to file"""
-    posted_file = "posted_heroes.json"
+NAVY, GOLD, WHITE, GREY = (22, 32, 48), (196, 164, 98), (240, 240, 236), (170, 178, 190)
+
+BRANCH_PREFIXES = ("Marine Corps", "Air Force", "Coast Guard", "Space Force",
+                   "Marines", "Marine", "Army", "Navy")
+RANK_WORDS = {
+    "1st", "2nd", "3rd", "first", "second", "third", "class", "staff", "master",
+    "command", "lance", "gunnery", "petty", "officer", "chief", "senior",
+    "warrant", "seaman", "airman", "ensign", "private", "specialist", "sergeant",
+    "corporal", "hospitalman", "hospital", "corpsman", "apprentice", "recruit",
+    "fireman", "constructionman", "technical", "tech.", "j.g.", "2", "3", "4", "5",
+}
+COUNTRIES = (r"(?:Iraq|Afghanistan|Syria|Kuwait|Qatar|Bahrain|Jordan|Pakistan|"
+             r"Djibouti|Niger|Somalia|Kenya|Yemen|Oman|Saudi Arabia|"
+             r"United Arab Emirates|Turkey|Uzbekistan|Kyrgyzstan|Egypt|Germany|"
+             r"Kosovo|Libya|the Philippines|Mali|Cameroon|Chad|Persian Gulf|"
+             r"Arabian Gulf|Arabian Sea|Red Sea|Gulf of Aden)")
+PLACE_RE = re.compile(
+    r"\b(?:in|near|at|outside)\s+((?:(?:[A-Z][\w'’.\-]*|al|as|ad|an|of|the|"
+    r"province|district|city)[\s,]+){0,6}?" + COUNTRIES + r")\b")
+HOMETOWN_RE = re.compile(r"^\s*(?:(\d{1,3}),\s*)?of\s+([^;]+?)\s*;", re.I)
+GENERIC_IMG = re.compile(r"honor-the-fallen|no[-_]?photo|placeholder|default|silhouette|blank", re.I)
+
+FONT_CANDIDATES = {
+    False: ["/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    True: ["/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+           "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+           "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+}
+
+
+@dataclass
+class Member:
+    url: str
+    title: str = ""
+    branch: str = ""
+    rank: str = ""
+    name: str = ""
+    died: date | None = None
+    died_text: str = ""
+    conflict: str = ""
+    age: str = ""
+    hometown: str = ""
+    place: str = ""
+    summary: str = ""
+    photo_url: str | None = None
+    thumb_url: str | None = None
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def make_session(proxy=None):
+    s = requests.Session()
+    s.headers["User-Agent"] = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    retry = Retry(total=3, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=("GET",))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    return s
+
+
+SCRAPE = make_session(PROXY)
+FB = make_session()
+
+
+def norm(text):
+    return " ".join((text or "").split())
+
+
+def clean_url(href, base):
+    return urljoin(base, href.strip().rstrip(":").strip())
+
+
+def get_soup(url, params=None):
     try:
-        data = {'posted_heroes': list(posted_heroes)}
-        with open(posted_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"[*] Saved {len(posted_heroes)} posted heroes to tracking file")
-    except Exception as e:
-        print(f"[!] Error saving posted heroes file: {e}")
-
-def create_hero_id(person):
-    """Create a unique ID for a hero based on name and date"""
-    # Use name and date to create unique identifier
-    hero_string = f"{person['name']}_{person['date']}"
-    return hashlib.md5(hero_string.encode()).hexdigest()
-
-def select_unposted_hero(service_members):
-    """Select a random hero who hasn't been posted before"""
-    if not service_members:
-        return None
-    
-    # Load previously posted heroes
-    posted_heroes = load_posted_heroes()
-    print(f"[*] Found {len(posted_heroes)} previously posted heroes")
-    
-    # Filter out already posted heroes
-    unposted_heroes = []
-    for hero in service_members:
-        hero_id = create_hero_id(hero)
-        if hero_id not in posted_heroes:
-            unposted_heroes.append(hero)
-        else:
-            print(f"[*] Skipping already posted hero: {hero['name']}")
-    
-    print(f"[*] Found {len(unposted_heroes)} unposted heroes out of {len(service_members)} total")
-    
-    if not unposted_heroes:
-        print("[!] All heroes for this date have been posted before!")
-        print("[*] Will reset tracking and start over with random selection...")
-        # Reset the tracking file and use all heroes
-        posted_heroes.clear()
-        save_posted_heroes(posted_heroes)
-        unposted_heroes = service_members
-    
-    # Select random hero from unposted list
-    selected_hero = random.choice(unposted_heroes)
-
-    # Mark this hero as posted
-    hero_id = create_hero_id(selected_hero)
-    posted_heroes.add(hero_id)
-    save_posted_heroes(posted_heroes)
-
-    print(f"[*] Selected unposted hero: {selected_hero['name']} - {selected_hero['date']}")
-    return selected_hero
-
-def get_fallen_service_members(date):
-    """Query fallen service members for a specific date"""
-    base_url = "https://thefallen.militarytimes.com/search"
-    formatted_date = date.strftime("%m%%2F%d%%2F%Y")
-    query_url = f"{base_url}?year=&year_month=&first_name=&last_name=&start_date={formatted_date}&end_date={formatted_date}&conflict=&home_state=&home_town="
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
-    
-    try:
-        response = requests.get(query_url, headers=headers, proxies=proxies, timeout=30)
+        r = SCRAPE.get(url, params=params, timeout=30)
     except requests.RequestException as e:
-        print(f"[!] Network error fetching {query_url}: {e}")
-        return []
+        log(f"  request failed: {url}: {e}")
+        return None, url
+    if r.status_code != 200 or "Access Denied" in r.text or "Captcha" in r.text:
+        log(f"  blocked or failed ({r.status_code}): {r.url}")
+        return None, r.url
+    return BeautifulSoup(r.text, "html.parser"), r.url
 
-    if response.status_code != 200 or "Access Denied" in response.text or "Captcha" in response.text:
-        print(f"[!] Failed or blocked when fetching {query_url} (Status: {response.status_code})")
-        return []
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    fallen_list = []
+# ---------------------------------------------------------------- search
 
-    entries = soup.select(".data-box")
-    for entry in entries:
-        name_tag = entry.select_one(".data-box-right h3 a")
-        name = name_tag.text.strip() if name_tag else "Unknown"
-        
-        date_tag = entry.select_one(".data-box-right .blue-bold")
-        date_of_death = date_tag.text.strip() if date_tag else "Unknown Date"
-        
-        profile_link = name_tag["href"] if name_tag and "href" in name_tag.attrs else ""
-        # Clean up profile link - remove any trailing colons or extra characters
-        if profile_link:
-            profile_link = profile_link.rstrip(':').rstrip()
-        
-        image_tag = entry.select_one(".data-box-left img, .record-image img")
-        image_url = image_tag["src"] if image_tag and "src" in image_tag.attrs else ""
-        
-        # Check for S3 bucket URLs or make sure image URL is absolute
-        if image_url:
-            if image_url.startswith("https://s3.amazonaws.com/"):
-                # S3 URL is already absolute, use as-is
-                pass
-            elif image_url.startswith("/"):
-                image_url = f"https://thefallen.militarytimes.com{image_url}"
-        
-        # Also check for record-image div for higher quality S3 images
-        record_image_div = entry.select_one(".record-image")
-        if record_image_div and not image_url.startswith("https://s3.amazonaws.com/"):
-            record_img = record_image_div.select_one("img")
-            if record_img and record_img.get("src"):
-                potential_s3_url = record_img["src"]
-                if potential_s3_url.startswith("https://s3.amazonaws.com/"):
-                    image_url = potential_s3_url  # Prefer S3 URLs for better quality
+def next_page(soup, current):
+    a = soup.find("a", rel="next", href=True)
+    if not a:
+        labels = {"next", "next »", "next ›", "»", "›"}
+        a = next((x for x in soup.find_all("a", href=True)
+                  if x.get_text(strip=True).lower() in labels), None)
+    if not a:
+        return None
+    nxt = clean_url(a["href"], current)
+    return None if nxt == current else nxt
 
-        fallen_list.append({
-            "name": name,
-            "date": date_of_death,
-            "link": profile_link,
-            "image_url": image_url
-        })
 
-    return fallen_list
-
-def search_comprehensive_range(start_date, end_date):
-    """Search for all fallen service members in a date range"""
-    print(f"[*] Comprehensive search from {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
-    
-    all_service_members = []
-    current_date = start_date
-    
-    while current_date <= end_date:
-        print(f"[*] Searching {current_date.strftime('%m/%d/%Y')}...")
-        fallen = get_fallen_service_members(current_date)
-        
-        if fallen:
-            print(f"    Found {len(fallen)} service members")
-            for person in fallen:
-                if person["image_url"]:
-                    all_service_members.append(person)
-                    print(f"    ✅ {person['name']} - {person['date']} (has photo)")
-        
-        current_date += timedelta(days=1)
-        time.sleep(1)  # Rate limiting for comprehensive search
-    
-    return all_service_members
-
-def get_detailed_service_member_info(profile_link):
-    """Get detailed information from the service member's profile page"""
-    if not profile_link:
-        return {}
-    
-    # Clean the profile link and construct a safe absolute URL
-    profile_link = profile_link.rstrip(':').rstrip()
-    base = "https://thefallen.militarytimes.com"
-    full_url = urljoin(base, profile_link)
-
-    # Reject URLs that escaped to a different host
-    parsed = urlparse(full_url)
-    if parsed.netloc != "thefallen.militarytimes.com" or parsed.scheme != "https":
-        print(f"[!] Rejected suspicious profile URL: {full_url}")
-        return {}
-
-    print(f"    → Fetching: {full_url}")  # Debug URL
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
-    
-    try:
-        response = requests.get(full_url, headers=headers, proxies=proxies, timeout=30)
-        if response.status_code != 200:
-            print(f"[!] Failed to fetch profile: {full_url} (Status: {response.status_code})")
-            return {}
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        details = {}
-        
-        # Extract structured information from record-txt div
-        record_txt = soup.select_one(".record-txt")
-        if record_txt:
-            # Get rank, branch, and name from h1
-            h1_tag = record_txt.select_one("h1.h1-size")
-            if h1_tag:
-                full_name_rank = h1_tag.get_text().strip()
-                details["full_name_with_rank"] = full_name_rank
-                print(f"    → Found name with rank: {full_name_rank}")
-            
-            # Get operation and date from h2
-            h2_tag = record_txt.select_one("h2")
-            if h2_tag:
-                h2_text = h2_tag.get_text().strip()
-                details["death_info"] = h2_text
-                print(f"    → Found death info: {h2_text}")
-                
-                # Extract date from h2 text
-                date_match = re.search(r'Died ([^S]+) Serving', h2_text)
-                if date_match:
-                    details["formatted_date"] = date_match.group(1).strip()
-                
-                # Extract operation
-                if "Operation" in h2_text:
-                    operation_match = re.search(r'Operation ([^"]+)', h2_text)
-                    if operation_match:
-                        details["operation"] = f"Operation {operation_match.group(1).strip()}"
-            
-            # Get branch from hidden input
-            branch_input = record_txt.select_one('input[name="dimension2"]')
-            if branch_input:
-                details["branch"] = branch_input.get("value", "").strip()
-                print(f"    → Found branch: {details['branch']}")
-        
-        # Get age, hometown, unit, and circumstances from content between <hr> tags
-        if record_txt:
-            # Find the content between <hr> tags or after the first <hr>
-            hr_tags = record_txt.find_all("hr")
-            if hr_tags:
-                # Get text content after first <hr> and before second <hr> (if exists)
-                content_after_hr = ""
-                if len(hr_tags) >= 1:
-                    # Get all text between the <hr> tags or after the first one
-                    parts = []
-                    current = hr_tags[0].next_sibling
-                    while current and (len(hr_tags) < 2 or current != hr_tags[1]):
-                        if hasattr(current, 'get_text'):
-                            parts.append(current.get_text())
-                        elif isinstance(current, str):
-                            parts.append(current)
-                        current = current.next_sibling
-                    content_after_hr = ''.join(parts)
-                
-                if content_after_hr:
-                    content_text = content_after_hr.strip()
-                    print(f"    → Found detailed content: {content_text}")
-                    
-                    # Parse the structured content
-                    # Format: "29, of Morgantown, Ky.; assigned to the 617th Military Police Company..."
-                    
-                    # Extract age and hometown (before first semicolon)
-                    parts = content_text.split(';')
-                    if parts:
-                        age_hometown_part = parts[0].strip()
-                        
-                        # Extract age (number at start)
-                        age_match = re.match(r'^(\d+)', age_hometown_part)
-                        if age_match:
-                            details["age"] = age_match.group(1)
-                            print(f"    → Found age: {details['age']}")
-                        
-                        # Extract hometown (after "of")
-                        hometown_match = re.search(r'of\s+([^;]+)', age_hometown_part)
-                        if hometown_match:
-                            hometown = hometown_match.group(1).strip().rstrip('.')
-                            details["hometown"] = hometown
-                            print(f"    → Found hometown: {hometown}")
-                    
-                    # Extract unit assignment (after "assigned to")
-                    # Look for pattern: "assigned to [unit]" which comes after city, state
-                    unit_match = re.search(r'assigned to (?:the\s+)?([^;,]+(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;]*)', content_text, re.IGNORECASE)
-                    if unit_match:
-                        unit = unit_match.group(1).strip()
-                        
-                        # Completely ignore anything with Sightline Media Group
-                        if "Sightline Media Group" not in unit:
-                            details["unit"] = unit
-                            print(f"    → Found unit: {unit}")
-                        else:
-                            print(f"    → Ignored Sightline Media Group reference")
-                    
-                    # Alternative pattern: look for military unit keywords after location
-                    if not details.get("unit"):
-                        # Look for units that come after city/state pattern
-                        alt_unit_patterns = [
-                            r'(?:assigned to|with|of) (?:the\s+)?(\d+(?:st|nd|rd|th)?\s+[^;,]*(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;,]*)',
-                            r'(?:assigned to|with|of) (?:the\s+)?([A-Z][^;,]*(?:Company|Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^;,]*)'
-                        ]
-                        
-                        for pattern in alt_unit_patterns:
-                            alt_match = re.search(pattern, content_text, re.IGNORECASE)
-                            if alt_match:
-                                alt_unit = alt_match.group(1).strip()
-                                # Still filter out Sightline
-                                if "Sightline Media Group" not in alt_unit and len(alt_unit) > 5:
-                                    details["unit"] = alt_unit
-                                    print(f"    → Found unit (alt pattern): {alt_unit}")
-                                    break
-                    
-                    # Extract circumstances of death (usually after the last semicolon)
-                    if len(parts) > 1:
-                        circumstances_part = parts[-1].strip()
-                        if len(circumstances_part) > 20:  # Only if substantial content
-                            # Clean up the circumstances and capitalize first letter
-                            circumstances = circumstances_part.rstrip('.')
-                            if circumstances:
-                                circumstances = circumstances[0].upper() + circumstances[1:] if len(circumstances) > 1 else circumstances.upper()
-                                if not circumstances.endswith('.'):
-                                    circumstances += '.'
-                                details["circumstances"] = circumstances
-                                print(f"    → Found circumstances: {circumstances}")
-            
-            # Fallback: try to find the first <p> after record-txt if no <hr> content
-            if not details.get("age"):
-                next_p = record_txt.find_next_sibling("p")
-                if next_p:
-                    p_text = next_p.get_text().strip()
-                    print(f"    → Fallback paragraph: {p_text}")
-                    
-                    # Extract age (number at start of paragraph)
-                    age_match = re.match(r'^(\d+)', p_text)
-                    if age_match:
-                        details["age"] = age_match.group(1)
-                        print(f"    → Found age (fallback): {details['age']}")
-                    
-                    # Extract hometown (everything after "of ")
-                    hometown_match = re.search(r'of (.+)', p_text)
-                    if hometown_match:
-                        hometown = hometown_match.group(1).strip().rstrip('.')
-                        details["hometown"] = hometown
-                        print(f"    → Found hometown (fallback): {hometown}")
-        
-        # Also check if there's a better quality S3 image URL in the profile
-        profile_image_div = soup.select_one(".record-image")
-        if profile_image_div:
-            profile_img = profile_image_div.select_one("img")
-            if profile_img and profile_img.get("src"):
-                s3_image_url = profile_img["src"]
-                if s3_image_url.startswith("https://s3.amazonaws.com/"):
-                    details["high_quality_image_url"] = s3_image_url
-                    print(f"    → Found S3 image: {s3_image_url}")
-        
-        # Get all text content for additional parsing if needed
-        content = soup.get_text()
-        
-        # Extract location of death/incident (where they died)
-        death_location_patterns = [
-            r'killed in ([^,\n.]+(?:, [A-Za-z]+)?)',
-            r'died in ([^,\n.]+(?:, [A-Za-z]+)?)',
-            r'in ([A-Za-z\s]+(?:, Iraq|, Afghanistan|, Syria))',
-            r'(Iraq|Afghanistan|Syria|Kuwait|Pakistan|Jordan|Somalia|Yemen)',
-            r'province of ([A-Za-z\s]+)',
-            r'near ([A-Za-z\s]+(?:, Iraq|, Afghanistan))'
-        ]
-        
-        for pattern in death_location_patterns:
-            death_location_match = re.search(pattern, content, re.IGNORECASE)
-            if death_location_match:
-                death_location = death_location_match.group(1).strip()
-                if len(death_location) > 2 and not death_location.lower().startswith(('the', 'was', 'and', 'who', 'a ')):
-                    details["death_location"] = death_location
-                    break
-        
-        # Get unit information - look for common unit patterns
-        unit_patterns = [
-            r'(\d+(?:st|nd|rd|th)?\s+[^,\n]{10,50}(?:Battalion|Regiment|Brigade|Division|Squadron|Wing|Group))',
-            r'([A-Z][\w\s]*(Battalion|Regiment|Brigade|Division|Squadron|Wing|Group)[^,\n]{0,30})'
-        ]
-        for pattern in unit_patterns:
-            unit_match = re.search(pattern, content, re.IGNORECASE)
-            if unit_match:
-                details["unit"] = unit_match.group(1).strip()
-                break
-        
-        # Extract circumstances/incident details
-        incident_section = soup.select_one('.incident-details, .profile-details, .bio')
-        if incident_section:
-            incident_text = incident_section.get_text().strip()
-            if len(incident_text) > 50:
-                # Truncate to first sentence or 200 characters
-                sentences = incident_text.split('.')
-                if sentences and len(sentences[0]) < 200:
-                    details["circumstances"] = sentences[0] + "."
-                else:
-                    details["circumstances"] = incident_text[:200] + "..."
-        
-        return details
-        
-    except Exception as e:
-        print(f"[!] Error getting details for {profile_link}: {e}")
-        return {}
-
-def process_image_original_size(image_data):
-    """Process image maintaining exact original dimensions - no modifications at all"""
-    try:
-        # Open image with PIL to validate it's a proper image
-        image = Image.open(io.BytesIO(image_data))
-        
-        # Get original dimensions
-        original_width, original_height = image.size
-        print(f"    → Original image dimensions: {original_width}x{original_height}")
-        
-        # For 125x200 military portrait photos, keep EXACTLY as-is
-        # No resizing, no cropping, no modifications whatsoever
-        
-        # Only convert color mode if absolutely necessary for Facebook compatibility
-        if image.mode not in ['RGB', 'RGBA']:
-            print(f"    → Converting from {image.mode} to RGB for compatibility")
-            image = image.convert('RGB')
-        
-        # Save with maximum quality and original dimensions
-        output = io.BytesIO()
-        image.save(output, format='JPEG', quality=100, optimize=False)
-        
-        print(f"    → Preserved exact dimensions: {original_width}x{original_height}")
-        return output.getvalue()
-        
-    except Exception as e:
-        print(f"[!] Error processing image: {e}")
-        print(f"    → Returning original image data unchanged")
-        return image_data  # Return original if any processing fails
-
-def test_facebook_credentials():
-    """Test if Facebook credentials are valid"""
-    print("[*] Testing Facebook credentials...")
-
-    if not ACCESS_TOKEN or not PAGE_ID:
-        print("❌ Missing ACCESS_TOKEN or PAGE_ID")
-        return False
-
-    test_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}"
-    try:
-        response = requests.get(
-            test_url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-            timeout=30
-        )
-        if response.status_code == 200:
-            page_info = response.json()
-            print(f"✅ Successfully connected to page: {page_info.get('name', 'Unknown')}")
-            return True
-        else:
-            print(f"❌ Failed to connect: {response.status_code} - {response.text}")
-            return False
-    except Exception as e:
-        print(f"❌ Error testing credentials: {e}")
-        return False
-
-def create_individual_hero_caption(person, details, hero_number, total_heroes):
-    """Create a caption for an individual hero post"""
-    today = datetime.today()
-    caption_parts = []
-    
-    # Header
-    caption_parts.append(f"📅 {today.strftime('%B %d')} Memorial")
-    caption_parts.append("")
-    
-    # Hero's name prominently displayed (use full name with rank if available)
-    if details.get("full_name_with_rank"):
-        caption_parts.append(f"🎗️ {details['full_name_with_rank'].upper()}")
-    else:
-        caption_parts.append(f"🎗️ {person['name'].upper()}")
-    caption_parts.append("")
-    
-    # Military information in clean format
-    military_info = []
-    
-    # Use branch from structured data
-    if details.get("branch"):
-        military_info.append(f"⚔️ {details['branch']}")
-    
-    if details.get("unit"):
-        military_info.append(f"🏛️ {details['unit']}")
-    
-    if details.get("operation"):
-        military_info.append(f"🌟 {details['operation']}")
-    
-    if details.get("age"):
-        military_info.append(f"👤 Age {details['age']}")
-    
-    if details.get("hometown"):
-        military_info.append(f"🏠 {details['hometown']}")
-    
-    # Add military info
-    caption_parts.extend(military_info)
-    caption_parts.append("")
-    
-    # Sacrifice information - use structured date if available
-    if details.get("formatted_date"):
-        caption_parts.append(f"📅 Date of Sacrifice: {details['formatted_date']}")
-    else:
-        caption_parts.append(f"📅 Date of Sacrifice: {person['date']}")
-    
-    if details.get("death_location"):
-        caption_parts.append(f"📍 Location: {details['death_location']}")
-    
-    caption_parts.append("")
-    
-    # Circumstances if available
-    if details.get("circumstances"):
-        caption_parts.append("💔 How They Served:")
-        caption_parts.append(details['circumstances'])
-        caption_parts.append("")
-    
-    # Footer
-    caption_parts.append("🕊️ We will never forget your service and sacrifice.")
-    caption_parts.append("🙏 Thank you for your ultimate sacrifice for our freedom.")
-    caption_parts.append("⭐ A true American hero.")
-    caption_parts.append("")
-    caption_parts.append(f"🔗 Learn more: {person['link'].rstrip(':').rstrip()}")
-    caption_parts.append("")
-    caption_parts.append("#FallenHeroes #NeverForget #Military #Sacrifice #Honor #Memorial #GoldStar #Hero #Freedom")
-    
-    return "\n".join(caption_parts)
-
-def post_individual_heroes(service_members):
-    """Post individual photos with captions for each service member using modern Facebook API"""
-    print(f"[*] Creating individual posts for {len(service_members)} heroes...")
-    successful_posts = 0
-    total_heroes = len(service_members)
-    
-    for i, person in enumerate(service_members, 1):
-        if not person["image_url"]:
-            print(f"[!] No image for {person['name']}, skipping...")
-            continue
-        
-        print(f"[*] Processing {i}/{total_heroes}: {person['name']}...")
-        
-        # Get detailed information
-        print(f"    → Fetching profile details...")
-        details = get_detailed_service_member_info(person["link"])
-        
-        # Use high-quality S3 image if available from profile, otherwise use original
-        image_url_to_use = details.get("high_quality_image_url", person["image_url"])
-        print(f"    → Using image: {image_url_to_use}")
-        
-        # Create individual hero caption
-        caption = create_individual_hero_caption(person, details, i, total_heroes)
-        
+def find_profiles(month, day, today):
+    """Return {profile_url: thumbnail_url} for every death on month/day, all years."""
+    found = {}
+    for year in range(START_YEAR, today.year + 1):
         try:
-            # Download the image (prefer S3 URL if available)
-            print(f"    → Downloading image from source...")
-            proxies = {"http": PROXY, "https": PROXY} if USE_PROXY and PROXY else None
-            
-            # Use proper headers to avoid 403 blocking
-            image_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            }
-            
-            # Try downloading with proper headers
-            image_response = requests.get(image_url_to_use, headers=image_headers, proxies=proxies, timeout=30)
-            
-            if image_response.status_code == 403:
-                print(f"    ⚠️  403 Forbidden - trying alternative approach...")
-                
-                # Try without some headers that might trigger blocking
-                simple_headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-                image_response = requests.get(image_url_to_use, headers=simple_headers, proxies=proxies, timeout=30)
-                
-                if image_response.status_code == 403:
-                    print(f"    ⚠️  Still 403 - trying with session and referer...")
-                    
-                    # Create a session and add referer
-                    session = requests.Session()
-                    session.headers.update({
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Referer": "https://thefallen.militarytimes.com/"
-                    })
-                    
-                    image_response = session.get(image_url_to_use, proxies=proxies, timeout=30)
-            
-            if image_response.status_code != 200:
-                print(f"    ❌ Failed to download image (Status: {image_response.status_code})")
-                print(f"    ❌ URL: {image_url_to_use}")
-                print(f"    ❌ Response: {image_response.text[:200]}...")
-                
-                # Try to find alternative image URL from the profile page
-                if details.get("high_quality_image_url") and image_url_to_use != person["image_url"]:
-                    print(f"    → Trying fallback to original image URL...")
-                    fallback_response = requests.get(person["image_url"], headers=image_headers, proxies=proxies, timeout=30)
-                    if fallback_response.status_code == 200:
-                        image_response = fallback_response
-                        print(f"    ✅ Fallback image downloaded successfully")
-                    else:
-                        print(f"    ❌ Fallback also failed: {fallback_response.status_code}")
-                        continue
-                else:
-                    continue
-            
-            original_image_data = image_response.content
-            
-            # Validate image data
-            if len(original_image_data) < 1000:  # Less than 1KB is probably not a valid image
-                print(f"    ❌ Image file too small, likely invalid")
-                continue
-            
-            # Process image maintaining exact original size (125x200)
-            print(f"    → Processing image - preserving exact original dimensions...")
-            
-            # Check if we should skip processing entirely for better quality
-            skip_processing = os.getenv("SKIP_IMAGE_PROCESSING", "false").lower() == "true"
-            
-            if skip_processing:
-                print(f"    → Skipping image processing - using original file")
-                processed_image_data = original_image_data
-            else:
-                processed_image_data = process_image_original_size(original_image_data)
-                
-                # Verify we didn't accidentally change dimensions
-                try:
-                    test_image = Image.open(io.BytesIO(processed_image_data))
-                    processed_size = test_image.size
-                    original_test = Image.open(io.BytesIO(original_image_data))
-                    original_size = original_test.size
-                    
-                    if processed_size != original_size:
-                        print(f"    ⚠️  Warning: Dimensions changed! Using original instead")
-                        print(f"    Original: {original_size}, Processed: {processed_size}")
-                        processed_image_data = original_image_data
-                    else:
-                        print(f"    ✅ Verified dimensions preserved: {processed_size}")
-                except:
-                    # If verification fails, use original to be safe
-                    print(f"    → Using original image data to be safe")
-                    processed_image_data = original_image_data
-            
-            # Create unique filename to prevent any potential overwrites
-            timestamp = str(int(time.time()))
-            name_hash = hashlib.md5(person['name'].encode()).hexdigest()[:8]
-            unique_filename = f"hero_{name_hash}_{timestamp}.jpg"
-            
-            # Method 1: Try posting using the feed endpoint with media
-            print(f"    → Posting to Facebook using feed API...")
-            
-            # First upload the photo without publishing
-            upload_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/photos"
-            files = {'source': (unique_filename, processed_image_data, 'image/jpeg')}
-            upload_data = {
-                "access_token": ACCESS_TOKEN,
-                "published": "false"  # Don't publish yet
-            }
-            
-            upload_response = requests.post(upload_url, data=upload_data, files=files, timeout=60)
-            
-            if upload_response.status_code == 200:
-                upload_result = upload_response.json()
-                photo_id = upload_result.get("id")
-                
-                if photo_id:
-                    print(f"    ✅ Photo uploaded (ID: {photo_id})")
-                    
-                    # Now create a feed post with the photo
-                    feed_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
-                    feed_data = {
-                        "message": caption,
-                        "attached_media": json.dumps([{"media_fbid": photo_id}]),
-                        "access_token": ACCESS_TOKEN
-                    }
-                    
-                    feed_response = requests.post(feed_url, data=feed_data, timeout=60)
-                    
-                    if feed_response.status_code == 200:
-                        result = feed_response.json()
-                        post_id = result.get("id", "unknown")
-                        print(f"    ✅ Successfully created feed post (Post ID: {post_id})")
-                        successful_posts += 1
-                    else:
-                        print(f"    ❌ Feed post failed: {feed_response.status_code}")
-                        print(f"    Error: {feed_response.text}")
-                        
-                        # Method 2: Try just posting as text if photo attachment fails
-                        print(f"    → Trying text-only post...")
-                        text_data = {
-                            "message": f"{caption}\n\n🖼️ Photo: {image_url_to_use}",
-                            "access_token": ACCESS_TOKEN
-                        }
-                        
-                        text_response = requests.post(feed_url, data=text_data, timeout=60)
-                        if text_response.status_code == 200:
-                            result = text_response.json()
-                            post_id = result.get("id", "unknown")
-                            print(f"    ✅ Posted as text with image link (Post ID: {post_id})")
-                            successful_posts += 1
-                        else:
-                            print(f"    ❌ Text post also failed: {text_response.text}")
-                else:
-                    print(f"    ❌ No photo ID returned from upload")
-            else:
-                print(f"    ❌ Photo upload failed: {upload_response.status_code}")
-                print(f"    Error: {upload_response.text}")
-                
-                # Method 3: Try direct text post with image URL
-                print(f"    → Trying direct text post with image URL...")
-                feed_url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/feed"
-                direct_data = {
-                    "message": f"{caption}\n\n🖼️ Hero Photo: {image_url_to_use}",
-                    "access_token": ACCESS_TOKEN
-                }
-                
-                direct_response = requests.post(feed_url, data=direct_data, timeout=60)
-                if direct_response.status_code == 200:
-                    result = direct_response.json()
-                    post_id = result.get("id", "unknown")
-                    print(f"    ✅ Posted as text with image URL (Post ID: {post_id})")
-                    successful_posts += 1
-                else:
-                    print(f"    ❌ All posting methods failed")
-                    print(f"    Final error: {direct_response.text}")
-                
-            # Add delay between posts
-            if i < total_heroes:
-                print(f"    → Waiting 10 seconds before next hero...")
-                time.sleep(10)
-                
-        except Exception as e:
-            print(f"    ❌ Error processing {person['name']}: {e}")
+            d = date(year, month, day)
+        except ValueError:
+            continue  # Feb 29 in non-leap years
+        if d > today:
             continue
-    
-    print(f"\n[*] ✅ Successfully created {successful_posts} individual posts out of {total_heroes} heroes")
-    return successful_posts
+        stamp = d.strftime("%m/%d/%Y")
+        params = {"year": "", "year_month": "", "first_name": "", "last_name": "",
+                  "start_date": stamp, "end_date": stamp, "conflict": "",
+                  "home_state": "", "home_town": ""}
+        before, url, pages = len(found), SEARCH_URL, 0
+        while url and pages < 20:
+            soup, final = get_soup(url, params if pages == 0 else None)
+            if not soup:
+                break
+            pages += 1
+            for box in soup.select(".data-box"):
+                a = box.select_one(".data-box-right h3 a[href]")
+                if not a:
+                    continue
+                img = box.select_one(".data-box-left img[src]")
+                found.setdefault(clean_url(a["href"], final),
+                                 clean_url(img["src"], final) if img else None)
+            url = next_page(soup, final)
+            time.sleep(DELAY)
+        log(f"{stamp}: {len(found) - before} found")
+    return found
 
-def post_images_to_facebook(service_members):
-    """Select one random unposted service member and create a single memorial post"""
-    if not service_members:
-        print("❌ No service members to post")
-        return 0
-    
-    # Select an unposted hero for today's memorial
-    selected_hero = select_unposted_hero(service_members)
-    
-    if not selected_hero:
-        print("❌ No suitable hero found for posting")
-        return 0
-    
-    print(f"[*] Creating memorial post for hero of the day: {selected_hero['name']}")
-    
-    # Create individual post for the selected hero
-    success_count = post_individual_heroes([selected_hero])  # Pass as single-item list
-    
-    if success_count > 0:
-        print(f"\n✅ Successfully created memorial post for {selected_hero['name']}")
-        return success_count
-    else:
-        print(f"\n❌ Failed to create memorial post")
-        return 0
+
+# ---------------------------------------------------------------- profile
+
+def hidden(rec, cls):
+    el = rec.select_one(f"input.{cls}")
+    return norm(el.get("value", "")) if el else ""
+
+
+def official_summary(rec):
+    """Text between the first and second <hr> in .record-txt (the casualty notice)."""
+    hrs = rec.find_all("hr")
+    if not hrs:
+        return ""
+    parts = []
+    for sib in hrs[0].next_siblings:
+        if getattr(sib, "name", None) == "hr":
+            break
+        parts.append(sib.get_text(" ") if hasattr(sib, "get_text") else str(sib))
+    return norm(" ".join(parts))
+
+
+def is_rank_token(tok):
+    return tok.lower() in RANK_WORDS or bool(re.fullmatch(r"[A-Z][a-z]{1,4}\.", tok))
+
+
+def split_title(title, branch):
+    """'Army Spc. Anthony D. Kinslow' -> ('Army', 'Spc.', 'Anthony D. Kinslow')"""
+    rest, found_branch = title, branch
+    for b in ((branch,) if branch else ()) + BRANCH_PREFIXES:
+        if rest.lower().startswith(b.lower() + " "):
+            rest, found_branch = rest[len(b):].strip(), found_branch or b
+            break
+    tokens = rest.split()
+    i = 0
+    while i < len(tokens) - 1 and is_rank_token(tokens[i]):
+        i += 1
+    return found_branch, " ".join(tokens[:i]), " ".join(tokens[i:])
+
+
+def parse_place(summary):
+    m = re.search(r"\b(?:died|killed)\b", summary, re.I)
+    text = summary[m.start():] if m else summary.split(";", 1)[-1]
+    p = PLACE_RE.search(text)
+    return p.group(1).strip(" ,") if p else ""
+
+
+def scrape_profile(url, thumb):
+    soup, _ = get_soup(url)
+    if not soup:
+        return None
+    rec = soup.select_one(".record-txt")
+    if not rec:
+        log(f"  no record found: {url}")
+        return None
+
+    m = Member(url=url, thumb_url=thumb)
+    h1, h2 = rec.select_one("h1"), rec.select_one("h2")
+    m.title = norm(h1.get_text()) if h1 else ""
+    h2_text = norm(h2.get_text()) if h2 else ""
+
+    m.conflict = hidden(rec, "dimension1")
+    if not m.conflict and (c := re.search(r"Serving During (.+)$", h2_text)):
+        m.conflict = c.group(1)
+    m.died_text = hidden(rec, "dimension3")
+    if not m.died_text and (c := re.search(r"Died (.+?) Serving", h2_text)):
+        m.died_text = c.group(1)
+    try:
+        m.died = datetime.strptime(m.died_text, "%B %d, %Y").date()
+    except ValueError:
+        pass
+
+    m.branch, m.rank, m.name = split_title(m.title, hidden(rec, "dimension2"))
+    m.summary = official_summary(rec)
+    if hm := HOMETOWN_RE.search(m.summary):
+        m.age, m.hometown = hm.group(1) or "", norm(hm.group(2))
+    m.place = parse_place(m.summary)
+
+    img = soup.select_one(".record-image img[src]")
+    m.photo_url = clean_url(img["src"], url) if img else None
+    return m
+
+
+# ---------------------------------------------------------------- images
+
+def font(size, bold=False):
+    for path in FONT_CANDIDATES[bold]:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def to_jpeg(img):
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=92, optimize=True, progressive=True)
+    return buf.getvalue()
+
+
+def fetch_image(url):
+    try:
+        r = SCRAPE.get(url, timeout=30)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content))
+        img.load()
+    except Exception as e:
+        log(f"  image unavailable ({url}): {e}")
+        return None
+    return img if min(img.size) >= 60 else None
+
+
+def compose_photo(img):
+    """Fit the photo inside a square canvas over a blurred fill. No stretch, no crop."""
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    bg = ImageOps.fit(img, CANVAS, LANCZOS).filter(ImageFilter.GaussianBlur(28))
+    bg = Image.blend(bg, Image.new("RGB", CANVAS, (0, 0, 0)), 0.5)
+    scale = min(CANVAS[0] / img.width, CANVAS[1] / img.height)
+    fg = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), LANCZOS)
+    bg.paste(fg, ((CANVAS[0] - fg.width) // 2, (CANVAS[1] - fg.height) // 2))
+    return to_jpeg(bg)
+
+
+def wrap(draw, text, fnt, max_width):
+    lines, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if draw.textlength(trial, font=fnt) <= max_width or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    return lines + ([line] if line else [])
+
+
+def make_placeholder(m):
+    W, H = CANVAS
+    img = Image.new("RGB", CANVAS, NAVY)
+    d = ImageDraw.Draw(img)
+    d.rectangle([36, 36, W - 37, H - 37], outline=GOLD, width=3)
+    d.rectangle([50, 50, W - 51, H - 51], outline=GOLD, width=1)
+
+    name = m.name or m.title or "Unknown"
+    size = 88
+    while size > 40:
+        name_font = font(size, bold=True)
+        name_lines = wrap(d, name, name_font, W - 200)
+        if len(name_lines) <= 3 and all(d.textlength(l, font=name_font) <= W - 200 for l in name_lines):
+            break
+        size -= 6
+
+    blocks = []  # (text or None for rule, font, fill, gap_after)
+    if m.branch:
+        blocks.append((m.branch.upper(), font(34), GOLD, 28))
+    if m.rank:
+        blocks.append((m.rank, font(54), WHITE, 22))
+    for i, line in enumerate(name_lines):
+        blocks.append((line, name_font, WHITE, 12 if i < len(name_lines) - 1 else 40))
+    blocks.append((None, None, GOLD, 40))
+    if m.died_text:
+        blocks.append((m.died_text, font(38), GREY, 14))
+    if m.conflict:
+        blocks.append((m.conflict, font(32), GREY, 0))
+
+    heights = []
+    for text, fnt, _, _ in blocks:
+        heights.append(2 if text is None else d.textbbox((0, 0), text, font=fnt)[3]
+                       - d.textbbox((0, 0), text, font=fnt)[1])
+    y = (H - sum(h + b[3] for h, b in zip(heights, blocks))) // 2
+    for (text, fnt, fill, gap), h in zip(blocks, heights):
+        if text is None:
+            d.line([(W // 2 - 90, y), (W // 2 + 90, y)], fill=fill, width=2)
+        else:
+            top = d.textbbox((0, 0), text, font=fnt)[1]
+            d.text(((W - d.textlength(text, font=fnt)) / 2, y - top), text, font=fnt, fill=fill)
+        y += h + gap
+    return to_jpeg(img)
+
+
+def build_image(m):
+    for src in (m.photo_url, m.thumb_url):
+        if src and not GENERIC_IMG.search(src):
+            img = fetch_image(src)
+            if img:
+                return compose_photo(img), True
+    return make_placeholder(m), False
+
+
+# ---------------------------------------------------------------- text
+
+def sentence(m):
+    s = m.title or m.name
+    if m.age:
+        s += f", {m.age}"
+    if m.hometown:
+        s += f", of {m.hometown}"
+    s += f", died {m.died_text}" if m.died_text else ", died"
+    if m.place:
+        s += f", in {m.place}"
+    if m.conflict:
+        s += f", during {m.conflict}"
+    return s + "."
+
+
+def photo_caption(m):
+    return "\n".join(x for x in (sentence(m), m.summary, m.url) if x)
+
+
+def build_post(members, label):
+    n = len(members)
+    who = "one American service member" if n == 1 else f"{n} American service members"
+    lead = (f"On {label} in years past, {who} died while serving in the nation's post-9/11 "
+            f"military operations. Their names, hometowns and where they died are recorded "
+            f"below, drawn from the Military Times Honor the Fallen database.")
+    body = "\n".join(sentence(m) for m in members)
+    return f"{lead}\n\n{body}\n\nFull service records: {BASE}"
+
+
+# ---------------------------------------------------------------- facebook
+
+def graph_post(path, data, files=None):
+    r = FB.post(f"{GRAPH}/{path}", data={**data, "access_token": TOKEN}, files=files, timeout=120)
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"error": {"message": r.text}}
+    if r.status_code != 200 or "error" in body:
+        raise RuntimeError(f"Graph API {path}: {r.status_code} {body.get('error', body)}")
+    return body
+
+
+def upload_unpublished(jpeg, caption):
+    return graph_post(f"{PAGE_ID}/photos",
+                      {"published": "false", "message": caption},
+                      files={"source": ("photo.jpg", jpeg, "image/jpeg")})["id"]
+
+
+def publish(message, media_ids):
+    data = {"message": message}
+    for i, mid in enumerate(media_ids):
+        data[f"attached_media[{i}]"] = json.dumps({"media_fbid": mid})
+    return graph_post(f"{PAGE_ID}/feed", data)["id"]
+
+
+def delete_photo(pid):
+    try:
+        FB.delete(f"{GRAPH}/{pid}", params={"access_token": TOKEN}, timeout=30)
+    except requests.RequestException:
+        pass
+
+
+# ---------------------------------------------------------------- main
 
 def main():
-    """Main function"""
-    print("=" * 60)
-    print("🇺🇸 FALLEN HEROES MEMORIAL FACEBOOK POSTING SCRIPT 🇺🇸")
-    print("=" * 60)
-    
-    # Debug environment variables (don't print actual values for security)
-    print(f"ACCESS_TOKEN: {'✅ Set (' + str(len(ACCESS_TOKEN)) + ' chars)' if ACCESS_TOKEN else '❌ NOT SET'}")
-    print(f"PAGE_ID: {'✅ Set (' + PAGE_ID + ')' if PAGE_ID else '❌ NOT SET'}")
-    print(f"USE_PROXY: {USE_PROXY}")
-    print(f"SEARCH_MODE: {SEARCH_MODE}")
-    
-    if not ACCESS_TOKEN or not PAGE_ID:
-        print("\n❌ Missing required environment variables!")
-        print("Please set FB_ACCESS_TOKEN and FB_PAGE_ID")
-        return 1
-    
-    # Validate PAGE_ID is numeric
-    if not PAGE_ID.isdigit():
-        print(f"\n❌ PAGE_ID should be numeric, got: {PAGE_ID}")
-        return 1
-    
-    print(f"\n✅ Credentials configured - proceeding with memorial search...")
-    
-    today = datetime.today()
-    all_service_members = []
-    
-    if SEARCH_MODE == "comprehensive":
-        # Search from Iraq invasion start date to present
-        iraq_invasion_date = datetime(2003, 3, 20)
-        print(f"\n[*] 🔍 COMPREHENSIVE SEARCH: Iraq invasion ({iraq_invasion_date.strftime('%m/%d/%Y')}) to present...")
-        all_service_members = search_comprehensive_range(iraq_invasion_date, today)
-        
-    elif SEARCH_MODE == "recent":
-        # Search last 30 days
-        start_date = today - timedelta(days=30)
-        print(f"\n[*] 🔍 RECENT SEARCH: Last 30 days ({start_date.strftime('%m/%d/%Y')} to {today.strftime('%m/%d/%Y')})...")
-        all_service_members = search_comprehensive_range(start_date, today)
-        
+    today = date.today()
+    if os.getenv("TARGET_DATE"):
+        month, day = map(int, os.getenv("TARGET_DATE").split("-"))
     else:
-        # Default: search today across multiple years
-        search_years = list(range(2003, datetime.now().year + 1))
-        print(f"\n[*] 🔍 DAILY SEARCH: Searching for fallen service members on {today.strftime('%B %d')} across multiple years...")
-        
-        for year in search_years:
-            try:
-                search_date = today.replace(year=year)
-                print(f"\n[*] Checking {search_date.strftime('%B %d, %Y')}...")
-                
-                fallen = get_fallen_service_members(search_date)
-                
-                if fallen:
-                    print(f"    Found {len(fallen)} service members")
-                    # Only add those with images
-                    for person in fallen:
-                        if person["image_url"]:
-                            all_service_members.append(person)
-                            print(f"    ✅ {person['name']} - {person['date']} (has photo)")
-                        else:
-                            print(f"    ⚠️  {person['name']} - {person['date']} (no photo)")
-                else:
-                    print(f"    No service members found")
-                    
-                time.sleep(1)  # Rate limiting
-                
-            except ValueError:
-                # Handle leap year issues (Feb 29)
-                print(f"    Skipping {year} (date doesn't exist)")
-                continue
-        
-    print(f"\n" + "=" * 60)
-    
-    if all_service_members:
-        print(f"📊 SUMMARY: Found {len(all_service_members)} service members with photos")
-        print(f"🎯 Will randomly select 1 hero for today's memorial")
-        print(f"🚀 Selecting random hero for today's memorial...")
-        print("=" * 60)
-        
-        success_count = post_images_to_facebook(all_service_members)
-        
-        print("\n" + "=" * 60)
-        if success_count > 0:
-            print(f"✅ COMPLETED: Successfully created today's memorial post")
-        else:
-            print("❌ FAILED: No memorial post was created")
-        print("🇺🇸 Honor and remember our fallen heroes 🇺🇸")
-        print("=" * 60)
-        
-        return 0 if success_count > 0 else 1
-    else:
-        print("📭 No fallen service members with images found for this search.")
-        print("🇺🇸 We honor all who have served 🇺🇸")
-        print("=" * 60)
+        month, day = today.month, today.day
+    label = f"{date(2000, month, day):%B} {day}"
+
+    if not DRY_RUN and (not TOKEN or not PAGE_ID.isdigit()):
+        log("FB_ACCESS_TOKEN and a numeric FB_PAGE_ID are required.")
+        return 1
+
+    log(f"Searching {label}, {START_YEAR}-{today.year}")
+    profiles = find_profiles(month, day, today)
+    log(f"{len(profiles)} unique profiles")
+
+    members = []
+    for url, thumb in profiles.items():
+        m = scrape_profile(url, thumb)
+        if m:
+            members.append(m)
+            log(f"  {m.title} | {m.died_text} | {m.place or 'place not listed'}")
+        time.sleep(DELAY)
+    if not members:
+        log("No records for this date. Nothing posted.")
         return 0
 
+    members.sort(key=lambda m: m.died or date.max)
+    images = []
+    for m in members:
+        jpeg, real = build_image(m)
+        images.append(jpeg)
+        log(f"  image: {'photo' if real else 'placeholder'} for {m.title}")
+
+    message = build_post(members, label)
+
+    if DRY_RUN:
+        os.makedirs("preview", exist_ok=True)
+        for i, (m, jpeg) in enumerate(zip(members, images), 1):
+            with open(f"preview/{i:02d}.jpg", "wb") as f:
+                f.write(jpeg)
+            with open(f"preview/{i:02d}.txt", "w") as f:
+                f.write(photo_caption(m))
+        with open("preview/post.txt", "w") as f:
+            f.write(message)
+        log(f"Dry run: {len(members)} images and post text written to preview/")
+        return 0
+
+    uploaded = []
+    try:
+        for m, jpeg in zip(members, images):
+            uploaded.append(upload_unpublished(jpeg, photo_caption(m)))
+            time.sleep(1)
+        post_id = publish(message, uploaded)
+    except Exception as e:
+        log(f"Post failed, removing {len(uploaded)} unpublished photos: {e}")
+        for pid in uploaded:
+            delete_photo(pid)
+        return 1
+
+    log(f"Published post {post_id} with {len(uploaded)} images.")
+    return 0
+
+
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())

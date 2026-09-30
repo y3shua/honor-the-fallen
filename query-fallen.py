@@ -3,27 +3,27 @@
 Honor the Fallen daily memorial post.
 
 Finds every service member in the Military Times "Honor the Fallen" database
-who died on today's month/day in any year, scrapes each profile, builds a
-uniform image for each (real photo or rank/name placeholder), and publishes
-ONE Facebook Page post with every image attached.
+who died on today's month/day in any year, renders them as cards on one image
+(or a few, 9 per image), and publishes ONE Facebook Page post.
 
 Env:
-  FB_ACCESS_TOKEN   Page access token (pages_manage_posts, pages_read_engagement)
-  FB_PAGE_ID        Numeric Page ID
-  GRAPH_VERSION     Graph API version (default v23.0)
-  TARGET_DATE       Optional MM-DD override (default: today)
-  START_YEAR        First year to search (default 2001)
-  DRY_RUN           "true" writes preview/ files instead of posting
-  USE_PROXY, PROXY_URL  Optional proxy for militarytimes.com requests
+  FB_ACCESS_TOKEN, FB_PAGE_ID   Page token (pages_manage_posts) and numeric Page ID
+  GRAPH_VERSION                 default v23.0
+  TARGET_DATE                   optional MM-DD override
+  START_YEAR                    default 2001
+  DRY_RUN                       "true" writes preview/ instead of posting
+  USE_PROXY, PROXY_URL          optional proxy for militarytimes.com
 """
 import io
 import json
+import math
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import lru_cache
 from urllib.parse import urljoin
 
 import requests
@@ -34,7 +34,6 @@ from urllib3.util.retry import Retry
 
 BASE = "https://thefallen.militarytimes.com"
 SEARCH_URL = f"{BASE}/search"
-CANVAS = (1080, 1080)
 LANCZOS = Image.Resampling.LANCZOS
 DELAY = 1.0
 
@@ -45,7 +44,14 @@ START_YEAR = int(os.getenv("START_YEAR", "2001"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 PROXY = os.getenv("PROXY_URL") if os.getenv("USE_PROXY", "false").lower() == "true" else None
 
-NAVY, GOLD, WHITE, GREY = (22, 32, 48), (196, 164, 98), (240, 240, 236), (170, 178, 190)
+# Layout
+COLS_MAX, PER_SHEET = 3, 9
+CARD_W, PHOTO_H, CAPTION_H = 420, 525, 200
+CARD_H = PHOTO_H + CAPTION_H
+GAP, MARGIN, HEADER_H, FOOTER_H = 28, 48, 170, 70
+
+BG, PANEL, NAVY = (16, 22, 34), (28, 38, 56), (22, 32, 48)
+GOLD, WHITE, GREY = (196, 164, 98), (242, 242, 238), (170, 178, 190)
 
 BRANCH_PREFIXES = ("Marine Corps", "Air Force", "Coast Guard", "Space Force",
                    "Marines", "Marine", "Army", "Navy")
@@ -156,7 +162,7 @@ def find_profiles(month, day, today):
         try:
             d = date(year, month, day)
         except ValueError:
-            continue  # Feb 29 in non-leap years
+            continue
         if d > today:
             continue
         stamp = d.strftime("%m/%d/%Y")
@@ -190,7 +196,6 @@ def hidden(rec, cls):
 
 
 def official_summary(rec):
-    """Text between the first and second <hr> in .record-txt (the casualty notice)."""
     hrs = rec.find_all("hr")
     if not hrs:
         return ""
@@ -207,7 +212,6 @@ def is_rank_token(tok):
 
 
 def split_title(title, branch):
-    """'Army Spc. Anthony D. Kinslow' -> ('Army', 'Spc.', 'Anthony D. Kinslow')"""
     rest, found_branch = title, branch
     for b in ((branch,) if branch else ()) + BRANCH_PREFIXES:
         if rest.lower().startswith(b.lower() + " "):
@@ -263,8 +267,9 @@ def scrape_profile(url, thumb):
     return m
 
 
-# ---------------------------------------------------------------- images
+# ---------------------------------------------------------------- drawing helpers
 
+@lru_cache(maxsize=None)
 def font(size, bold=False):
     for path in FONT_CANDIDATES[bold]:
         if os.path.exists(path):
@@ -275,11 +280,53 @@ def font(size, bold=False):
         return ImageFont.load_default()
 
 
+def wrap(draw, text, fnt, max_w):
+    lines, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if draw.textlength(trial, font=fnt) <= max_w or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    return lines + ([line] if line else [])
+
+
+def fit(draw, text, max_w, size, min_size, max_lines=1, bold=False):
+    """Largest font (size..min_size) where text wraps into max_lines within max_w."""
+    while True:
+        f = font(size, bold)
+        lines = wrap(draw, text, f, max_w)
+        if (len(lines) <= max_lines and all(draw.textlength(l, font=f) <= max_w for l in lines)) \
+                or size <= min_size:
+            return lines[:max_lines], f
+        size -= 2
+
+
+def draw_block(draw, blocks, box):
+    """Draw [(lines, font, fill, gap_after)] centered in box (x0, y0, x1, y1)."""
+    x0, y0, x1, y1 = box
+    def lh(f):
+        a, d = f.getmetrics()
+        return a + d
+    total = sum(len(lines) * lh(f) + gap for lines, f, _, gap in blocks if lines)
+    y = y0 + (y1 - y0 - total) // 2
+    for lines, f, fill, gap in blocks:
+        if not lines:
+            continue
+        for line in lines:
+            draw.text((x0 + (x1 - x0 - draw.textlength(line, font=f)) / 2, y), line, font=f, fill=fill)
+            y += lh(f)
+        y += gap
+
+
 def to_jpeg(img):
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=92, optimize=True, progressive=True)
     return buf.getvalue()
 
+
+# ---------------------------------------------------------------- images
 
 def fetch_image(url):
     try:
@@ -293,109 +340,116 @@ def fetch_image(url):
     return img if min(img.size) >= 60 else None
 
 
-def compose_photo(img):
-    """Fit the photo inside a square canvas over a blurred fill. No stretch, no crop."""
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    bg = ImageOps.fit(img, CANVAS, LANCZOS).filter(ImageFilter.GaussianBlur(28))
-    bg = Image.blend(bg, Image.new("RGB", CANVAS, (0, 0, 0)), 0.5)
-    scale = min(CANVAS[0] / img.width, CANVAS[1] / img.height)
-    fg = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), LANCZOS)
-    bg.paste(fg, ((CANVAS[0] - fg.width) // 2, (CANVAS[1] - fg.height) // 2))
-    return to_jpeg(bg)
-
-
-def wrap(draw, text, fnt, max_width):
-    lines, line = [], ""
-    for word in text.split():
-        trial = f"{line} {word}".strip()
-        if draw.textlength(trial, font=fnt) <= max_width or not line:
-            line = trial
-        else:
-            lines.append(line)
-            line = word
-    return lines + ([line] if line else [])
-
-
-def make_placeholder(m):
-    W, H = CANVAS
-    img = Image.new("RGB", CANVAS, NAVY)
-    d = ImageDraw.Draw(img)
-    d.rectangle([36, 36, W - 37, H - 37], outline=GOLD, width=3)
-    d.rectangle([50, 50, W - 51, H - 51], outline=GOLD, width=1)
-
-    name = m.name or m.title or "Unknown"
-    size = 88
-    while size > 40:
-        name_font = font(size, bold=True)
-        name_lines = wrap(d, name, name_font, W - 200)
-        if len(name_lines) <= 3 and all(d.textlength(l, font=name_font) <= W - 200 for l in name_lines):
-            break
-        size -= 6
-
-    blocks = []  # (text or None for rule, font, fill, gap_after)
-    if m.branch:
-        blocks.append((m.branch.upper(), font(34), GOLD, 28))
-    if m.rank:
-        blocks.append((m.rank, font(54), WHITE, 22))
-    for i, line in enumerate(name_lines):
-        blocks.append((line, name_font, WHITE, 12 if i < len(name_lines) - 1 else 40))
-    blocks.append((None, None, GOLD, 40))
-    if m.died_text:
-        blocks.append((m.died_text, font(38), GREY, 14))
-    if m.conflict:
-        blocks.append((m.conflict, font(32), GREY, 0))
-
-    heights = []
-    for text, fnt, _, _ in blocks:
-        heights.append(2 if text is None else d.textbbox((0, 0), text, font=fnt)[3]
-                       - d.textbbox((0, 0), text, font=fnt)[1])
-    y = (H - sum(h + b[3] for h, b in zip(heights, blocks))) // 2
-    for (text, fnt, fill, gap), h in zip(blocks, heights):
-        if text is None:
-            d.line([(W // 2 - 90, y), (W // 2 + 90, y)], fill=fill, width=2)
-        else:
-            top = d.textbbox((0, 0), text, font=fnt)[1]
-            d.text(((W - d.textlength(text, font=fnt)) / 2, y - top), text, font=fnt, fill=fill)
-        y += h + gap
-    return to_jpeg(img)
-
-
-def build_image(m):
+def get_photo(m):
     for src in (m.photo_url, m.thumb_url):
         if src and not GENERIC_IMG.search(src):
             img = fetch_image(src)
             if img:
-                return compose_photo(img), True
-    return make_placeholder(m), False
+                return img
+    return None
+
+
+def fit_photo(img, size):
+    """Contain the photo in size over a blurred fill. No stretch, no crop."""
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    bg = ImageOps.fit(img, size, LANCZOS).filter(ImageFilter.GaussianBlur(24))
+    bg = Image.blend(bg, Image.new("RGB", size, (0, 0, 0)), 0.5)
+    scale = min(size[0] / img.width, size[1] / img.height)
+    fg = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), LANCZOS)
+    bg.paste(fg, ((size[0] - fg.width) // 2, (size[1] - fg.height) // 2))
+    return bg
+
+
+def placeholder_panel(m, size):
+    """Rank and name only, as large as they will fit."""
+    w, h = size
+    img = Image.new("RGB", size, NAVY)
+    d = ImageDraw.Draw(img)
+    d.rectangle([18, 18, w - 19, h - 19], outline=GOLD, width=2)
+    max_w = w - 70
+    rank = norm(f"{m.branch} {m.rank}") or ""
+    name = m.name or m.title or "Unknown"
+    rank_lines, rank_font = fit(d, rank, max_w, 48, 28, max_lines=2) if rank else ([], None)
+    name_lines, name_font = fit(d, name, max_w, 76, 36, max_lines=3, bold=True)
+    draw_block(d, [(rank_lines, rank_font, GOLD, 22), (name_lines, name_font, WHITE, 0)],
+               (0, 0, w, h))
+    return img
+
+
+def render_card(m, photo):
+    card = Image.new("RGB", (CARD_W, CARD_H), PANEL)
+    top = fit_photo(photo, (CARD_W, PHOTO_H)) if photo else placeholder_panel(m, (CARD_W, PHOTO_H))
+    card.paste(top, (0, 0))
+    d = ImageDraw.Draw(card)
+    d.line([(0, PHOTO_H), (CARD_W, PHOTO_H)], fill=GOLD, width=3)
+
+    max_w = CARD_W - 36
+    rank = norm(f"{m.branch} {m.rank}").upper()
+    blocks = []
+    if rank:
+        blocks.append((*fit(d, rank, max_w, 24, 16), GOLD, 8))
+    lines, f = fit(d, m.name or m.title, max_w, 36, 22, max_lines=2, bold=True)
+    blocks.append((lines, f, WHITE, 10))
+    if m.died_text:
+        blocks.append((*fit(d, m.died_text, max_w, 24, 16), GREY, 4))
+    if m.place:
+        blocks.append((*fit(d, m.place, max_w, 22, 15), GREY, 0))
+    draw_block(d, blocks, (0, PHOTO_H + 4, CARD_W, CARD_H))
+    return card
+
+
+def render_sheet(members, photos, label, index, total):
+    n = len(members)
+    cols = min(COLS_MAX, n)
+    rows = math.ceil(n / cols)
+    W = 2 * MARGIN + cols * CARD_W + (cols - 1) * GAP
+    H = HEADER_H + rows * CARD_H + (rows - 1) * GAP + FOOTER_H + MARGIN
+    sheet = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(sheet)
+
+    heading = f"Remembered on {label}" + (f"  ({index} of {total})" if total > 1 else "")
+    draw_block(d, [(*fit(d, "HONOR THE FALLEN", W - 2 * MARGIN, 30, 18), GOLD, 10),
+                   (*fit(d, heading, W - 2 * MARGIN, 52, 26, bold=True), WHITE, 0)],
+               (0, 20, W, HEADER_H))
+
+    for i, (m, photo) in enumerate(zip(members, photos)):
+        r, c = divmod(i, cols)
+        in_row = min(cols, n - r * cols)
+        row_w = in_row * CARD_W + (in_row - 1) * GAP
+        x = (W - row_w) // 2 + c * (CARD_W + GAP)
+        y = HEADER_H + r * (CARD_H + GAP)
+        sheet.paste(render_card(m, photo), (x, y))
+
+    draw_block(d, [(*fit(d, "Source: Military Times, Honor the Fallen", W - 2 * MARGIN, 22, 14),
+                    GREY, 0)],
+               (0, H - FOOTER_H - MARGIN // 2, W, H - MARGIN // 2))
+    return sheet
 
 
 # ---------------------------------------------------------------- text
 
-def sentence(m):
-    s = m.title or m.name
-    if m.age:
-        s += f", {m.age}"
-    if m.hometown:
-        s += f", of {m.hometown}"
-    s += f", died {m.died_text}" if m.died_text else ", died"
+def entry(m):
+    head = m.title + (f", {m.age}" if m.age else "")
+    died = f"Died {m.died_text}" if m.died_text else "Died"
     if m.place:
-        s += f", in {m.place}"
+        died += f", in {m.place}"
     if m.conflict:
-        s += f", during {m.conflict}"
-    return s + "."
-
-
-def photo_caption(m):
-    return "\n".join(x for x in (sentence(m), m.summary, m.url) if x)
+        died += f" ({m.conflict})"
+    return "\n".join(x for x in (head, m.hometown, died) if x)
 
 
 def build_post(members, label):
     n = len(members)
-    who = "one American service member" if n == 1 else f"{n} American service members"
-    lead = (f"On {label} in years past, {who} died while serving in the nation's post-9/11 "
-            f"military operations. Their names, hometowns and where they died are recorded "
-            f"below, drawn from the Military Times Honor the Fallen database.")
-    body = "\n".join(sentence(m) for m in members)
+    years = sorted({m.died.year for m in members if m.died})
+    when = f"on {label}"
+    if len(years) == 1:
+        when += f", {years[0]},"
+    elif years:
+        when += f" between {years[0]} and {years[-1]}"
+    who = "the American service member" if n == 1 else f"the {n} American service members"
+    lead = (f"Today we remember {who} who died {when} while serving in the nation's "
+            f"post-9/11 military operations.")
+    body = "\n\n".join(entry(m) for m in members)
     return f"{lead}\n\n{body}\n\nFull service records: {BASE}"
 
 
@@ -413,9 +467,8 @@ def graph_post(path, data, files=None):
 
 
 def upload_unpublished(jpeg, caption):
-    return graph_post(f"{PAGE_ID}/photos",
-                      {"published": "false", "message": caption},
-                      files={"source": ("photo.jpg", jpeg, "image/jpeg")})["id"]
+    return graph_post(f"{PAGE_ID}/photos", {"published": "false", "message": caption},
+                      files={"source": ("sheet.jpg", jpeg, "image/jpeg")})["id"]
 
 
 def publish(message, media_ids):
@@ -462,39 +515,44 @@ def main():
         return 0
 
     members.sort(key=lambda m: m.died or date.max)
-    images = []
+    photos = []
     for m in members:
-        jpeg, real = build_image(m)
-        images.append(jpeg)
-        log(f"  image: {'photo' if real else 'placeholder'} for {m.title}")
+        p = get_photo(m)
+        photos.append(p)
+        log(f"  {'photo' if p else 'placeholder'}: {m.title}")
+
+    chunks = [range(i, min(i + PER_SHEET, len(members)))
+              for i in range(0, len(members), PER_SHEET)]
+    sheets = []
+    for idx, rng in enumerate(chunks, 1):
+        group = [members[i] for i in rng]
+        img = render_sheet(group, [photos[i] for i in rng], label, idx, len(chunks))
+        sheets.append((to_jpeg(img), "\n".join(m.title for m in group)))
 
     message = build_post(members, label)
 
     if DRY_RUN:
         os.makedirs("preview", exist_ok=True)
-        for i, (m, jpeg) in enumerate(zip(members, images), 1):
-            with open(f"preview/{i:02d}.jpg", "wb") as f:
+        for i, (jpeg, _) in enumerate(sheets, 1):
+            with open(f"preview/sheet_{i}.jpg", "wb") as f:
                 f.write(jpeg)
-            with open(f"preview/{i:02d}.txt", "w") as f:
-                f.write(photo_caption(m))
         with open("preview/post.txt", "w") as f:
             f.write(message)
-        log(f"Dry run: {len(members)} images and post text written to preview/")
+        log(f"Dry run: {len(sheets)} image(s) and post text written to preview/")
         return 0
 
     uploaded = []
     try:
-        for m, jpeg in zip(members, images):
-            uploaded.append(upload_unpublished(jpeg, photo_caption(m)))
-            time.sleep(1)
+        for jpeg, caption in sheets:
+            uploaded.append(upload_unpublished(jpeg, caption))
         post_id = publish(message, uploaded)
     except Exception as e:
-        log(f"Post failed, removing {len(uploaded)} unpublished photos: {e}")
+        log(f"Post failed, removing {len(uploaded)} unpublished image(s): {e}")
         for pid in uploaded:
             delete_photo(pid)
         return 1
 
-    log(f"Published post {post_id} with {len(uploaded)} images.")
+    log(f"Published post {post_id}: {len(members)} members on {len(sheets)} image(s).")
     return 0
 
 
